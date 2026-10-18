@@ -1462,6 +1462,20 @@ async def send_prospect(
         p.status, p.skip_reason = "skipped", "This organization's own address — not a prospect"
         await db.commit()
         return SendOutcome("skipped", p.skip_reason)
+    # schedule_sends only schedules verified-deliverable addresses; this is the
+    # same rule at the last gate, for a verdict that changed after scheduling
+    # (a re-verification, a contact edit) — nothing goes on the wire that Hunter
+    # hasn't called deliverable.
+    contact = await db.get(Contact, p.contact_id) if p.contact_id else None
+    if contact is None or contact.email_verification_result != VERIFIED:
+        verdict = contact.email_verification_result if contact else None
+        p.scheduled_for = None
+        if verdict in (None, "unknown"):
+            await db.commit()
+            return SendOutcome("held", "email not verified yet")
+        p.status, p.skip_reason = "skipped", f"Email not verified deliverable (verification: {verdict})"
+        await db.commit()
+        return SendOutcome("skipped", p.skip_reason)
 
     # Claim, committed before the wire: whoever flips approved→sending owns the
     # send, and a crash after the transport accepted it leaves the row claimed

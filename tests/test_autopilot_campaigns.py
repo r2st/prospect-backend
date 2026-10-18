@@ -262,7 +262,7 @@ async def test_nothing_is_scheduled_outside_the_window(db_session):
 @pytest.mark.asyncio
 async def test_send_prospect_goes_through_the_dispatcher_and_records_the_send(db_session, monkeypatch):
     c = await _campaign(db_session)
-    ct = await _contact(db_session, "ok@acme.com")
+    ct = await _contact(db_session, "ok@acme.com", verified=True)
     p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="ok@acme.com",
                          status="approved", email_subject="Hi", email_body="Hello there")
     db_session.add(p)
@@ -307,7 +307,8 @@ async def test_a_dispatcher_hold_puts_the_prospect_back(db_session, monkeypatch)
 @pytest.mark.asyncio
 async def test_an_exception_mid_send_fails_rather_than_retrying(db_session, monkeypatch):
     c = await _campaign(db_session)
-    p = CampaignProspect(campaign_id=c.id, to_email="boom@acme.com", status="approved",
+    ct = await _contact(db_session, "boom@acme.com", verified=True)
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="boom@acme.com", status="approved",
                          email_subject="Hi", email_body="Hello")
     db_session.add(p)
     await db_session.commit()
@@ -1183,3 +1184,37 @@ async def test_an_own_address_queued_before_the_filter_is_refused_at_send_time(
     assert out.status == "skipped" and sent == []
     await db_session.refresh(p)
     assert p.status == "skipped" and "own address" in p.skip_reason
+
+
+
+@pytest.mark.parametrize("verdict, outcome, status", [
+    (None, "held", "approved"),             # not checked yet: wait, don't give up
+    ("unknown", "held", "approved"),
+    ("risky", "skipped", "skipped"),        # catch-all: never sent
+    ("undeliverable", "skipped", "skipped"),
+])
+@pytest.mark.asyncio
+async def test_nothing_hunter_hasnt_called_deliverable_reaches_the_wire(
+    db_session, monkeypatch, verdict, outcome, status
+):
+    """schedule_sends only schedules verified addresses; send_prospect holds the
+    same rule for a verdict that changed after scheduling."""
+    c = await _campaign(db_session)
+    ct = await _contact(db_session, "maybe@acme.com")
+    ct.email_verification_result = verdict
+    ct.email_verified_at = MIDWEEK if verdict else None
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=ct.email, status="approved",
+                         email_subject="Hi", email_body="Hello", scheduled_for=MIDWEEK)
+    db_session.add(p)
+    await db_session.commit()
+    sent = []
+
+    async def fake_send(db, **kw):
+        sent.append(kw)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    assert (await svc.send_prospect(db_session, p.id, MIDWEEK)).status == outcome
+    assert sent == []
+    await db_session.refresh(p)
+    assert p.status == status and p.scheduled_for is None
