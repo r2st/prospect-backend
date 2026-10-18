@@ -88,9 +88,27 @@ class ContactRead(ContactBase):
     unsubscribed: bool = False
     status: Optional[str] = None
     email_status: Optional[str] = None
+    # Hunter's verdict (deliverable / risky / undeliverable / unknown); None =
+    # never verified. Only "deliverable" is ever sent by a campaign.
+    email_verification_result: Optional[str] = None
     bounce_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class ContactFacetCount(BaseModel):
+    value: Optional[str] = None
+    label: str
+    count: int
+
+
+class ContactFacets(BaseModel):
+    """The contact database grouped by category, for the browse page's filters."""
+    total: int
+    verification: list[ContactFacetCount]
+    source: list[ContactFacetCount]
+    industry: list[ContactFacetCount]
+    campaign: list[ContactFacetCount]
 
 
 class ContactDetailRead(ContactRead):

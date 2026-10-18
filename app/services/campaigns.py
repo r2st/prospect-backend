@@ -402,22 +402,48 @@ async def queue_contacts(
     flagged, already a prospect of *any* campaign, already mailed by any path,
     or belonging to this org itself (:func:`own_addresses`).
     """
+    queued, _ = await queue_contacts_detailed(db, campaign, contacts, source=source)
+    return queued
+
+
+# Why queue_contacts_detailed passed a contact over — shown to the operator by
+# the add-to-campaign endpoints, so "nothing happened" always has a reason.
+SKIP_REASONS = {
+    "no_email": "No email address",
+    "blocked": "On the do-not-contact list or unsubscribed",
+    "own_org": "Your own organization's address",
+    "already_prospect": "Already a prospect in a campaign",
+    "already_mailed": "Already emailed — never sent twice",
+    "duplicate": "Listed twice",
+}
+
+
+async def queue_contacts_detailed(
+    db: AsyncSession, campaign: Campaign, contacts: list[Contact], *, source: str
+) -> tuple[int, dict[uuid.UUID, str]]:
+    """:func:`queue_contacts`, also returning ``{contact_id: SKIP_REASONS key}``."""
     own = await own_addresses(db)
+    skipped: dict[uuid.UUID, str] = {}
     candidates: dict[str, Contact] = {}
     for c in contacts:
         email = (c.email or "").strip().lower()
-        if not email or suppression.blocking_flag(c) is not None or email in candidates:
-            continue
-        if is_own_address(email, own):
+        if not email:
+            skipped[c.id] = "no_email"
+        elif suppression.blocking_flag(c) is not None:
+            skipped[c.id] = "blocked"
+        elif email in candidates:
+            skipped[c.id] = "duplicate"
+        elif is_own_address(email, own):
             logger.info("Campaign %s: not queueing %s — it is this org's own address", campaign.id, email)
-            continue
-        candidates[email] = c
+            skipped[c.id] = "own_org"
+        else:
+            candidates[email] = c
     if not candidates:
-        return 0
+        return 0, skipped
     emails = set(candidates)
-    excluded = await suppression.suppressed_addresses(db, emails)
-    excluded |= await previously_mailed(db, emails)
-    excluded |= set(
+    blocked = await suppression.suppressed_addresses(db, emails)
+    mailed = await previously_mailed(db, emails)
+    prospects = set(
         (
             await db.execute(
                 select(CampaignProspect.to_email).where(CampaignProspect.to_email.in_(emails))
@@ -426,7 +452,14 @@ async def queue_contacts(
     )
     queued = 0
     for email, contact in candidates.items():
-        if email in excluded:
+        if email in blocked:
+            skipped[contact.id] = "blocked"
+            continue
+        if email in mailed:
+            skipped[contact.id] = "already_mailed"
+            continue
+        if email in prospects:
+            skipped[contact.id] = "already_prospect"
             continue
         db.add(CampaignProspect(
             campaign_id=campaign.id,
@@ -439,7 +472,38 @@ async def queue_contacts(
         queued += 1
     if queued:
         await db.flush()
-    return queued
+    return queued, skipped
+
+
+async def add_contacts(
+    db: AsyncSession, campaign: Campaign, contacts: list[Contact], *, source: str
+) -> dict:
+    """Put chosen contacts into ``campaign`` — from the contact database or a manual add.
+
+    A contact with no email but a name and a company domain is first given one
+    the way discovery does (MX check, Hunter finder, guess); every address then
+    goes through Hunter verification on the campaign's next pass, and only a
+    deliverable one is ever sent. Returns ``{"queued", "skipped": [{contact_id,
+    email, reason, label}]}``.
+    """
+    targets: list[tuple[Company, Contact]] = []
+    for c in contacts:
+        if c.email or not plausible_person_name(c.first_name, c.last_name):
+            continue
+        company = await db.get(Company, c.company_id) if c.company_id else None
+        if company is not None and company.domain:
+            targets.append((company, c))
+    if targets:
+        await _address_contacts(db, targets)
+    queued, skipped = await queue_contacts_detailed(db, campaign, contacts, source=source)
+    by_id = {c.id: c for c in contacts}
+    return {
+        "queued": queued,
+        "skipped": [
+            {"contact_id": str(cid), "email": by_id[cid].email, "reason": r, "label": SKIP_REASONS[r]}
+            for cid, r in skipped.items()
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1151,10 +1215,17 @@ async def advance_warmup(db: AsyncSession, campaign: Campaign, now: Optional[dat
 # ---------------------------------------------------------------------------
 # Sending
 # ---------------------------------------------------------------------------
-async def sending_account(db: AsyncSession, campaign: Campaign) -> Optional[GmailAccount]:
-    if campaign.gmail_account_id is None:
+async def sending_account(db: AsyncSession, campaign: Campaign):
+    """The campaign's mailbox — a ``GmailAccount`` or ``SmtpAccount`` — or None
+    when it is gone, disconnected or has sending turned off."""
+    from app.models.smtp_account import SmtpAccount
+
+    if campaign.gmail_account_id is not None:
+        acct = await db.get(GmailAccount, campaign.gmail_account_id)
+    elif campaign.smtp_account_id is not None:
+        acct = await db.get(SmtpAccount, campaign.smtp_account_id)
+    else:
         return None
-    acct = await db.get(GmailAccount, campaign.gmail_account_id)
     if acct is None or acct.status != "connected" or not acct.sending_enabled:
         return None
     return acct
@@ -1227,12 +1298,12 @@ async def schedule_sends(
         return 0
     acct = await sending_account(db, campaign)
     if acct is None:
-        logger.info("schedule_sends campaign=%s: no sending account (gmail_account_id=%s)",
-                    campaign.id, campaign.gmail_account_id)
+        logger.info("schedule_sends campaign=%s: no sending account (gmail=%s smtp=%s)",
+                    campaign.id, campaign.gmail_account_id, campaign.smtp_account_id)
         campaign.status, campaign.pause_reason = "paused", "gmail_disconnected"
         await log_error(
             db, campaign,
-            "Paused automatically: the Gmail account for this campaign is disconnected "
+            "Paused automatically: the sending account for this campaign is disconnected "
             "or has sending turned off. Reconnect it, then resume.",
             now,
         )
@@ -1564,6 +1635,34 @@ async def send_approved_now(
         await db.rollback()
         return {"campaign_id": str(campaign_id), "error": str(exc)}
     return {"campaign_id": str(campaign_id), "verification": verification, "scheduled": scheduled}
+
+
+async def process_new_prospects(
+    db: AsyncSession, campaign_id: uuid.UUID, *, now: Optional[datetime] = None, schedule: ScheduleFn
+) -> dict:
+    """Verify, draft and schedule now — dispatched when contacts are added by hand.
+
+    :func:`send_approved_now` plus drafting: an added contact arrives queued,
+    so waiting for the tick would leave it unverified and undrafted for up to
+    15 minutes. Still no discovery. Every gate is the tick's own.
+    """
+    now = _aware(now)
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None or campaign.status != "active" or campaign.deleted_at is not None:
+        return {"campaign_id": str(campaign_id), "skipped": "not_active"}
+    try:
+        verification = await verify_prospects(db, campaign)
+        await db.commit()
+        drafted = await generate_drafts(db, campaign, now)
+        await db.commit()
+        scheduled = await schedule_sends(db, campaign, now, schedule=schedule)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Campaign %s processing added prospects failed", campaign_id)
+        await db.rollback()
+        return {"campaign_id": str(campaign_id), "error": str(exc)}
+    return {"campaign_id": str(campaign_id), "verification": verification,
+            "drafted": drafted, "scheduled": scheduled}
 
 
 async def run_campaigns_tick(

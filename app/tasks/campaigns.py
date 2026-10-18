@@ -8,6 +8,9 @@
 * ``send_approved_now`` — just verification and scheduling for one campaign,
   dispatched on approve and on resume so an approved email doesn't wait for
   the next tick.
+* ``process_new_prospects`` — verification, drafting and scheduling for one
+  campaign, dispatched when contacts are added by hand or from the contact
+  database.
 * ``send_campaign_prospect`` — one send, dispatched by the scheduler with a
   countdown so consecutive sends are 120–300s apart. Bound to the prospect's
   org with ``org_scope``; the claim inside ``send_prospect`` makes a duplicate
@@ -81,6 +84,22 @@ def send_approved_now(org_id: str, campaign_id: str):
         async with org_scope(uuid.UUID(org_id)):
             async with celery_session() as db:
                 return await send_now(db, uuid.UUID(campaign_id), schedule=_schedule)
+
+    return _run_async(_run())
+
+
+@celery_app.task(name="app.tasks.campaigns.process_new_prospects")
+def process_new_prospects(org_id: str, campaign_id: str):
+    """Verify, draft and schedule a campaign's added contacts now."""
+
+    async def _run():
+        from app.database_celery import celery_session
+        from app.org_context import org_scope
+        from app.services.campaigns import process_new_prospects as process
+
+        async with org_scope(uuid.UUID(org_id)):
+            async with celery_session() as db:
+                return await process(db, uuid.UUID(campaign_id), schedule=_schedule)
 
     return _run_async(_run())
 

@@ -79,6 +79,10 @@ class Campaign(Base, OrgScopedMixin):
     gmail_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("gmail_accounts.id", ondelete="SET NULL")
     )
+    # The sender is one of these two; the router clears the other (migration 125).
+    smtp_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("smtp_accounts.id", ondelete="SET NULL")
+    )
     daily_send_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
     send_window_start: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     send_window_end: Mapped[str] = mapped_column(String(5), nullable=False, default="18:00")

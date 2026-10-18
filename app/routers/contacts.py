@@ -20,6 +20,8 @@ from app.schemas.communication import CommunicationHistoryResponse
 from app.services.communication_history import get_contact_communications
 from app.services.contact_grouping import classify_group
 from app.schemas.contact import (
+    ContactFacets,
+    ContactFacetCount,
     BulkSuppressRequest,
     BulkSuppressResponse,
     BulkTagRequest,
@@ -103,6 +105,13 @@ async def list_contacts(
     has_bounced: Optional[bool] = Query(
         None, description="Only contacts that have (or haven't) ever bounced"
     ),
+    verification: Optional[str] = Query(
+        None, description="Hunter verdict: deliverable, risky, undeliverable, unknown, or unverified",
+    ),
+    industry: Optional[str] = Query(None, description="Company industry (partial match)"),
+    min_employees: Optional[int] = Query(None, ge=0),
+    max_employees: Optional[int] = Query(None, ge=0),
+    campaign_id: Optional[uuid.UUID] = Query(None, description="Only prospects of this campaign"),
     sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title, company_name"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
@@ -180,6 +189,28 @@ async def list_contacts(
             clauses = [tag_service.tag_clause(Contact.tags, t, dialect) for t in wanted]
             conditions.append(and_(*clauses) if tag_match == "all" else or_(*clauses))
 
+    if verification == "unverified":
+        conditions.append(Contact.email_verification_result.is_(None))
+    elif verification:
+        conditions.append(Contact.email_verification_result == verification)
+
+    if industry:
+        _ensure_company_join()
+        conditions.append(Company.industry_segment.ilike(contains_pattern(industry), escape=LIKE_ESCAPE))
+    if min_employees is not None:
+        _ensure_company_join()
+        conditions.append(Company.employee_count >= min_employees)
+    if max_employees is not None:
+        _ensure_company_join()
+        conditions.append(Company.employee_count <= max_employees)
+
+    if campaign_id is not None:
+        from app.models.campaign import CampaignProspect
+
+        conditions.append(Contact.id.in_(
+            select(CampaignProspect.contact_id).where(CampaignProspect.campaign_id == campaign_id)
+        ))
+
     # Company name filter (case-insensitive partial match, requires Company join)
     if company_name:
         _ensure_company_join()
@@ -223,6 +254,60 @@ async def list_contacts(
     contacts = list(result.scalars().all())
 
     return ContactListResponse(items=contacts, total=total, page=page, page_size=page_size)
+
+
+_VERIFICATION_LABELS = {
+    "deliverable": "Deliverable",
+    "risky": "Risky (catch-all)",
+    "undeliverable": "Undeliverable",
+    "unknown": "Unknown",
+    None: "Not verified",
+}
+
+
+@router.get("/facets", response_model=ContactFacets)
+async def contact_facets(db: AsyncSession = Depends(get_db)):
+    """Counts by category — Hunter verdict, source, industry, campaign.
+
+    The contact table is already the central, org-wide database (every
+    discovered person lands in it, deduplicated by email); this is what lets a
+    page group it. Contacts without an email are counted too — they are
+    people a search found and Hunter may still find an address for.
+    """
+    from app.models.campaign import Campaign, CampaignProspect
+
+    total = (await db.execute(select(func.count(Contact.id)))).scalar_one()
+    by_verdict = (await db.execute(
+        select(Contact.email_verification_result, func.count(Contact.id))
+        .group_by(Contact.email_verification_result)
+    )).all()
+    by_source = (await db.execute(
+        select(Contact.source, func.count(Contact.id))
+        .group_by(Contact.source).order_by(func.count(Contact.id).desc()).limit(20)
+    )).all()
+    by_industry = (await db.execute(
+        select(Company.industry_segment, func.count(Contact.id))
+        .join(Company, Contact.company_id == Company.id)
+        .where(Company.industry_segment.isnot(None))
+        .group_by(Company.industry_segment).order_by(func.count(Contact.id).desc()).limit(20)
+    )).all()
+    by_campaign = (await db.execute(
+        select(Campaign.id, Campaign.name, func.count(func.distinct(CampaignProspect.contact_id)))
+        .join(CampaignProspect, CampaignProspect.campaign_id == Campaign.id)
+        .where(Campaign.deleted_at.is_(None), CampaignProspect.contact_id.isnot(None))
+        .group_by(Campaign.id, Campaign.name).order_by(Campaign.name, Campaign.id)
+    )).all()
+    order = list(_VERIFICATION_LABELS)
+    return ContactFacets(
+        total=total,
+        verification=[
+            ContactFacetCount(value=v or "unverified", label=_VERIFICATION_LABELS.get(v, v or ""), count=n)
+            for v, n in sorted(by_verdict, key=lambda r: order.index(r[0]) if r[0] in order else 99)
+        ],
+        source=[ContactFacetCount(value=v, label=v or "Unknown", count=n) for v, n in by_source],
+        industry=[ContactFacetCount(value=v, label=v, count=n) for v, n in by_industry],
+        campaign=[ContactFacetCount(value=str(i), label=name, count=n) for i, name, n in by_campaign],
+    )
 
 
 @router.get("/check-duplicate", response_model=DuplicateCheckResponse)

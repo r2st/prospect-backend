@@ -59,7 +59,9 @@ class _Settings(BaseModel):
     send_on_weekends: Optional[bool] = None
     review_before_send: Optional[bool] = None
     attach_documents: Optional[bool] = None
+    # Legacy name; ``sender_account_id`` takes a Gmail *or* SMTP account id.
     gmail_account_id: Optional[uuid.UUID] = None
+    sender_account_id: Optional[uuid.UUID] = None
 
     @field_validator("send_window_start", "send_window_end")
     @classmethod
@@ -103,6 +105,7 @@ class CampaignOut(BaseModel):
     document_summary: Optional[str] = None
     icp_json: Optional[dict[str, Any]] = None
     gmail_account_id: Optional[uuid.UUID] = None
+    smtp_account_id: Optional[uuid.UUID] = None
     daily_send_limit: int
     send_window_start: str
     send_window_end: str
@@ -164,9 +167,63 @@ class SkipIn(BaseModel):
     reason: Optional[str] = Field(None, max_length=500)
 
 
+class AddContactsIn(BaseModel):
+    """Contacts picked from the contact database."""
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=500)
+
+
+class ManualProspectIn(BaseModel):
+    """One person typed in by the operator."""
+    company_name: str = Field(..., min_length=1, max_length=255)
+    domain: Optional[str] = Field(None, max_length=255)
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    title: Optional[str] = Field(None, max_length=255)
+    email: Optional[str] = Field(None, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: Optional[str]) -> Optional[str]:
+        from app.services.email_validation import is_valid_syntax
+
+        v = (v or "").strip().lower() or None
+        if v is not None and not is_valid_syntax(v):
+            raise ValueError("That doesn't look like an email address.")
+        return v
+
+
+class AddProspectsOut(BaseModel):
+    queued: int
+    skipped: list[dict[str, Any]]
+    # "dispatched" (verification and drafting start now) or "unavailable"
+    # (the broker is down; the next 15-minute tick picks them up).
+    processing: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _dispatch_processing(c: Campaign) -> str:
+    """Verify, draft and schedule newly added contacts now, not at the next tick.
+
+    Dispatched whatever the send window: verification and drafting are worth
+    doing at 3 a.m. even though the send waits for the window to open.
+    """
+    try:
+        from app.tasks.campaigns import process_new_prospects
+
+        process_new_prospects.delay(str(c.org_id), str(c.id))
+    except Exception as exc:  # pragma: no cover - broker-dependent
+        logger.warning("Could not dispatch processing for campaign %s: %s", c.id, exc)
+        return "unavailable"
+    return "dispatched"
+
+
+def _require_open(c: Campaign) -> None:
+    if c.status == "stopped" or c.deleted_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This campaign is stopped; create a new one.")
+
+
 def _dispatch_instant_send(c: Campaign) -> str:
     """Schedule the campaign's approved emails now instead of at the next tick.
 
@@ -197,6 +254,7 @@ def _out(c: Campaign) -> dict:
         "document_summary": c.document_summary,
         "icp_json": c.icp_json,
         "gmail_account_id": c.gmail_account_id,
+        "smtp_account_id": c.smtp_account_id,
         "daily_send_limit": c.daily_send_limit,
         "send_window_start": c.send_window_start,
         "send_window_end": c.send_window_end,
@@ -247,27 +305,58 @@ async def _get_prospect(db: AsyncSession, campaign: Campaign, prospect_id: uuid.
     return p
 
 
+class SenderOut(BaseModel):
+    id: uuid.UUID
+    kind: Literal["gmail", "smtp"]
+    email: str
+    display_name: Optional[str] = None
+    mine: bool = False
+
+
+async def _resolve_sender(db: AsyncSession, user: User, account_id: Optional[uuid.UUID]):
+    """``(kind, account)`` for a connected, sending-enabled Gmail or SMTP mailbox.
+
+    With an id, exactly that account (org-scoped by the read filter, so another
+    tenant's id is simply not found). Without one, the caller's own Gmail, then
+    their own SMTP account.
+    """
+    from app.models.smtp_account import SmtpAccount
+
+    for kind, model, order in (
+        ("gmail", GmailAccount, (GmailAccount.connected_at, GmailAccount.id)),
+        ("smtp", SmtpAccount, (SmtpAccount.email, SmtpAccount.id)),
+    ):
+        stmt = select(model).where(model.status == "connected", model.sending_enabled.is_(True))
+        stmt = stmt.where(model.id == account_id) if account_id is not None else stmt.where(model.user_id == user.id)
+        acct = (await db.execute(stmt.order_by(*order).limit(1))).scalars().first()
+        if acct is not None:
+            return kind, acct
+    if account_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "sender_unavailable",
+             "message": "That sending account isn't connected or has sending turned off."},
+        )
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        {"code": "gmail_required",
+         "message": "Connect a Gmail or SMTP account with sending turned on before starting a campaign."},
+    )
+
+
+def _set_sender(c: Campaign, kind: str, acct) -> None:
+    c.gmail_account_id = acct.id if kind == "gmail" else None
+    c.smtp_account_id = acct.id if kind == "smtp" else None
+
+
 async def _resolve_account(
     db: AsyncSession, user: User, account_id: Optional[uuid.UUID]
 ) -> GmailAccount:
-    stmt = select(GmailAccount).where(
-        GmailAccount.status == "connected", GmailAccount.sending_enabled.is_(True)
-    )
-    if account_id is not None:
-        stmt = stmt.where(GmailAccount.id == account_id)
-    else:
-        stmt = stmt.where(GmailAccount.user_id == user.id)
-    acct = (
-        await db.execute(stmt.order_by(GmailAccount.connected_at, GmailAccount.id).limit(1))
-    ).scalars().first()
-    if acct is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {
-                "code": "gmail_required",
-                "message": "Connect a Gmail account with sending turned on before starting a campaign.",
-            },
-        )
+    """Kept for callers that need a Gmail account specifically."""
+    kind, acct = await _resolve_sender(db, user, account_id)
+    if kind != "gmail":
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "gmail_required",
+                            "message": "This needs a Gmail account."})
     return acct
 
 
@@ -366,7 +455,9 @@ async def create_campaign(
         )
     if not await org_gemini.has_org_llm_key(db, user.org_id):
         raise HTTPException(status.HTTP_409_CONFLICT, AI_KEY_REQUIRED)
-    account = await _resolve_account(db, user, payload.gmail_account_id)
+    sender_kind, account = await _resolve_sender(
+        db, user, payload.sender_account_id or payload.gmail_account_id
+    )
 
     try:
         icp, summary = await svc.build_icp(db, user.org_id, list(docs))
@@ -387,7 +478,6 @@ async def create_campaign(
         document_ids=[str(i) for i in ids],
         document_summary=summary,
         icp_json=icp.model_dump(),
-        gmail_account_id=account.id,
         warmup_day=1,
         # Column defaults only apply at flush; _apply_settings reads them first.
         daily_send_limit=20,
@@ -395,10 +485,17 @@ async def create_campaign(
         send_window_end="18:00",
         timezone="America/Toronto",
         send_on_weekends=False,
-        review_before_send=False,
+        # On unless the caller says otherwise: the campaign is live, and runs
+        # its first search and drafting, the moment it is created. The wizard
+        # used to send its settings under a key this endpoint ignores, so every
+        # campaign got this default — and "off" meant auto-approving drafts the
+        # operator had asked to review.
+        review_before_send=True,
         attach_documents=False,
     )
-    _apply_settings(c, payload.model_dump(exclude={"name", "document_ids", "gmail_account_id"}))
+    _set_sender(c, sender_kind, account)
+    _apply_settings(c, payload.model_dump(
+        exclude={"name", "document_ids", "gmail_account_id", "sender_account_id"}))
     db.add(c)
     await db.commit()
     await db.refresh(c)
@@ -411,6 +508,27 @@ async def create_campaign(
     except Exception as exc:  # pragma: no cover - broker-dependent
         logger.warning("Could not dispatch first run for campaign %s: %s", c.id, exc)
     return _out(c)
+
+
+@router.get("/senders", response_model=list[SenderOut])
+async def list_senders(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Connected, sending-enabled mailboxes a campaign can send from — the
+    caller's own first, then the rest of the org's."""
+    from app.models.smtp_account import SmtpAccount
+
+    out: list[SenderOut] = []
+    for kind, model in (("gmail", GmailAccount), ("smtp", SmtpAccount)):
+        rows = (await db.execute(
+            select(model).where(model.status == "connected", model.sending_enabled.is_(True))
+            .order_by(model.email, model.id)
+        )).scalars().all()
+        out += [SenderOut(id=a.id, kind=kind, email=a.email,
+                          display_name=getattr(a, "display_name", None),
+                          mine=a.user_id == user.id) for a in rows]
+    return sorted(out, key=lambda a: (not a.mine, a.kind, a.email))
 
 
 @router.get("", response_model=list[CampaignOut])
@@ -474,16 +592,17 @@ async def update_campaign(
         c.name = data["name"].strip()
     if "icp_json" in data and data["icp_json"] is not None:
         c.icp_json = svc.Icp.model_validate(data["icp_json"]).model_dump()
-    if data.get("gmail_account_id"):
-        c.gmail_account_id = (await _resolve_account(db, user, data["gmail_account_id"])).id
+    if data.get("sender_account_id") or data.get("gmail_account_id"):
+        _set_sender(c, *await _resolve_sender(
+            db, user, data.get("sender_account_id") or data["gmail_account_id"]))
     _apply_settings(c, data)
 
     new_status = data.get("status")
     if new_status and new_status != c.status:
         if new_status == "active":
             # Resuming after an automatic pause: the cause must be fixed first.
-            if c.gmail_account_id is None or await svc.sending_account(db, c) is None:
-                c.gmail_account_id = (await _resolve_account(db, user, None)).id
+            if await svc.sending_account(db, c) is None:
+                _set_sender(c, *await _resolve_sender(db, user, None))
             c.pause_reason = None
             c.next_send_at = None
         elif new_status in ("paused", "stopped"):
@@ -659,3 +778,74 @@ async def skip_prospect(
     await db.commit()
     await db.refresh(p)
     return ProspectOut.model_validate(p, from_attributes=True)
+
+
+@router.post("/{campaign_id}/prospects/add", response_model=AddProspectsOut)
+async def add_contacts_to_campaign(
+    campaign_id: uuid.UUID,
+    payload: AddContactsIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Add contacts from the contact database. Each is verified by Hunter before
+    anything is drafted or sent; ``skipped`` says why any were passed over."""
+    c = await _get_campaign(db, campaign_id, user)
+    _require_open(c)
+    ids = list(dict.fromkeys(payload.contact_ids))
+    contacts = (await db.execute(select(Contact).where(Contact.id.in_(ids)))).scalars().all()
+    found = {ct.id for ct in contacts}
+    missing = [str(i) for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Contacts not found: {', '.join(missing[:5])}")
+    result = await svc.add_contacts(db, c, list(contacts), source="contact_db")
+    await db.commit()
+    processing = _dispatch_processing(c) if result["queued"] else "nothing_queued"
+    return AddProspectsOut(**result, processing=processing)
+
+
+@router.post("/{campaign_id}/prospects/manual", response_model=AddProspectsOut)
+async def add_manual_prospect(
+    campaign_id: uuid.UUID,
+    payload: ManualProspectIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Add one person by hand. They join the central contact database (merged
+    with the company and person if already there) and the campaign; with no
+    email given, Hunter looks for one at the company's domain. Either way the
+    address is verified before anything is sent."""
+    from app.services.crm_import import domain_from_email
+    from app.services.ingestion import CandidateRecord, ContactRecord, get_ingestion_service
+    from app.services.normalize import normalize_domain
+
+    c = await _get_campaign(db, campaign_id, user)
+    _require_open(c)
+    domain = normalize_domain(payload.domain) or domain_from_email(payload.email)
+    person = ContactRecord(
+        first_name=payload.first_name.strip(), last_name=(payload.last_name or "").strip() or None,
+        email=payload.email, title=(payload.title or "").strip() or None, source="manual",
+    )
+    ingest = get_ingestion_service()
+    result = await ingest.ingest(db, [CandidateRecord(
+        name=payload.company_name.strip(), domain=domain,
+        website=f"https://{domain}" if domain else None, source="manual", contacts=[person],
+    )])
+    outcome = result.outcomes[0] if result.outcomes else None
+    if outcome is None or outcome.company is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            (outcome.error if outcome else None) or "Couldn't save that company.",
+        )
+    if payload.email:
+        contact = (await db.execute(
+            select(Contact).where(func.lower(Contact.email) == payload.email)
+            .order_by(Contact.created_at, Contact.id).limit(1)
+        )).scalars().first()
+    else:
+        contact = await ingest._find_named_contact(db, outcome.company.id, person)
+    if contact is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Couldn't save that contact.")
+    added = await svc.add_contacts(db, c, [contact], source="manual")
+    await db.commit()
+    processing = _dispatch_processing(c) if added["queued"] else "nothing_queued"
+    return AddProspectsOut(**added, processing=processing)
