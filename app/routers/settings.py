@@ -20,15 +20,17 @@ from app.dependencies import OrgScope, get_org_scope
 from app.models.org_llm_key import OrgLlmKey
 from app.models.user import UserRole
 from app.services import crypto
-from app.services.org_gemini import DISCOVERY_PROVIDERS
+from app.services.org_gemini import DISCOVERY_PROVIDERS, PROVIDER_LABELS, SEARCH_PROVIDERS
 from app.services.credential_store import mask
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
-Provider = Literal["gemini", "groq", "openrouter"]
-assert set(Provider.__args__) == set(DISCOVERY_PROVIDERS)
+# LLMs (Discovery's fallback chain) and web-search APIs (Discovery's
+# grounding when Gemini's isn't available), stored in the same table.
+Provider = Literal["gemini", "anthropic", "groq", "openrouter", "tavily", "serper", "brave"]
+assert set(Provider.__args__) == set(DISCOVERY_PROVIDERS) | set(SEARCH_PROVIDERS)
 
 
 class LlmKeyUpdate(BaseModel):
@@ -52,6 +54,19 @@ class LlmKeyRead(BaseModel):
     provider: str
     key_hint: str
     has_key: bool
+    # "llm" | "search" — lets the settings page group them.
+    kind: str = "llm"
+    label: str = ""
+
+
+def _read(provider: str, row: "OrgLlmKey | None") -> LlmKeyRead:
+    return LlmKeyRead(
+        provider=provider,
+        key_hint=row.key_hint if row else "",
+        has_key=row is not None,
+        kind="search" if provider in SEARCH_PROVIDERS else "llm",
+        label=PROVIDER_LABELS.get(provider, provider),
+    )
 
 
 def _require_org_admin(scope: OrgScope) -> None:
@@ -81,17 +96,13 @@ async def list_llm_keys(
     scope: OrgScope = Depends(get_org_scope),
     db: AsyncSession = Depends(get_db),
 ):
-    """Every supported provider, in fallback order, with whether a key is saved."""
+    """Every supported provider — LLMs in fallback order, then web search —
+    with whether a key is saved."""
     _require_org_admin(scope)
-    out = []
-    for provider in DISCOVERY_PROVIDERS:
-        row = await _key_row(db, provider)
-        out.append(LlmKeyRead(
-            provider=provider,
-            key_hint=row.key_hint if row else "",
-            has_key=row is not None,
-        ))
-    return out
+    return [
+        _read(provider, await _key_row(db, provider))
+        for provider in (*DISCOVERY_PROVIDERS, *SEARCH_PROVIDERS)
+    ]
 
 
 @router.get("/llm-key", response_model=LlmKeyRead)
@@ -102,10 +113,7 @@ async def get_llm_key(
 ):
     """Check whether the org has a key set for ``provider``."""
     _require_org_admin(scope)
-    row = await _key_row(db, provider)
-    if row is None:
-        return LlmKeyRead(provider=provider, key_hint="", has_key=False)
-    return LlmKeyRead(provider=row.provider, key_hint=row.key_hint, has_key=True)
+    return _read(provider, await _key_row(db, provider))
 
 
 @router.put("/llm-key", response_model=LlmKeyRead)
@@ -134,7 +142,7 @@ async def set_llm_key(
         "Org %s LLM key (%s) updated by %s",
         scope.org_id, body.provider, scope.user.email,
     )
-    return LlmKeyRead(provider=row.provider, key_hint=row.key_hint, has_key=True)
+    return _read(body.provider, row)
 
 
 @router.delete("/llm-key", status_code=status.HTTP_204_NO_CONTENT)

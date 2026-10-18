@@ -56,9 +56,16 @@ T = TypeVar("T", bound=BaseModel)
 _breaker = CircuitBreaker(threshold=3, cooldown_seconds=120.0)
 
 
-# Fallback order. Settings → API Keys accepts exactly these.
-DISCOVERY_PROVIDERS: tuple[str, ...] = ("gemini", "groq", "openrouter")
-PROVIDER_LABELS = {"gemini": "Gemini", "groq": "Groq", "openrouter": "OpenRouter"}
+# Fallback order. Gemini stays the default; Claude is an optional second
+# choice on the org's own Anthropic API key (not a Claude.ai subscription).
+DISCOVERY_PROVIDERS: tuple[str, ...] = ("gemini", "anthropic", "groq", "openrouter")
+# Web search APIs, stored in the same table. Not LLMs: app.services.web_search
+# reads them, and Discovery uses one to ground any LLM in real pages.
+SEARCH_PROVIDERS: tuple[str, ...] = ("tavily", "serper", "brave")
+PROVIDER_LABELS = {
+    "gemini": "Gemini", "anthropic": "Claude", "groq": "Groq", "openrouter": "OpenRouter",
+    "tavily": "Tavily", "serper": "Serper", "brave": "Brave Search",
+}
 
 
 class GeminiKeyMissing(Exception):
@@ -70,7 +77,19 @@ class GeminiError(Exception):
 
 
 async def get_org_llm_keys(db: AsyncSession, org_id: uuid.UUID) -> dict[str, str]:
-    """The org's decrypted Discovery keys, ``{provider: key}`` in fallback order.
+    """The org's decrypted Discovery LLM keys, ``{provider: key}`` in fallback order."""
+    return await _org_keys(db, org_id, DISCOVERY_PROVIDERS)
+
+
+async def get_org_search_keys(db: AsyncSession, org_id: uuid.UUID) -> dict[str, str]:
+    """The org's decrypted web-search keys, ``{provider: key}`` in preference order."""
+    return await _org_keys(db, org_id, SEARCH_PROVIDERS)
+
+
+async def _org_keys(
+    db: AsyncSession, org_id: uuid.UUID, providers: tuple[str, ...]
+) -> dict[str, str]:
+    """Decrypted keys for ``providers``, ``{provider: key}`` in that order.
 
     ``org_llm_keys`` has no unique constraint on ``(org_id, provider)``, so a
     duplicate row is possible; the most recently updated one wins, with ``id``
@@ -82,7 +101,7 @@ async def get_org_llm_keys(db: AsyncSession, org_id: uuid.UUID) -> dict[str, str
             select(OrgLlmKey)
             .where(
                 OrgLlmKey.org_id == org_id,
-                OrgLlmKey.provider.in_(DISCOVERY_PROVIDERS),
+                OrgLlmKey.provider.in_(providers),
             )
             .order_by(OrgLlmKey.updated_at.desc(), OrgLlmKey.id)
         )
@@ -98,7 +117,7 @@ async def get_org_llm_keys(db: AsyncSession, org_id: uuid.UUID) -> dict[str, str
             continue
         if key:
             found[row.provider] = key
-    return {p: found[p] for p in DISCOVERY_PROVIDERS if p in found}
+    return {p: found[p] for p in providers if p in found}
 
 
 async def get_org_gemini_key(db: AsyncSession, org_id: uuid.UUID) -> Optional[str]:
@@ -172,8 +191,27 @@ def openrouter_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
     )
 
 
+def anthropic_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
+    """Claude through Anthropic's OpenAI-compatible endpoint.
+
+    Same Bearer auth and ``/chat/completions`` shape as every other provider,
+    so it shares chat_completion's retry, sibling-model fallback and breaker.
+    No response_format: the compatibility layer doesn't honour JSON mode, and
+    every Discovery prompt asks for JSON; _json_object_text tolerates prose.
+    """
+    settings = get_settings()
+    return ProviderSpec(
+        name=f"anthropic-org-{org_id}",
+        base_url=settings.anthropic_openai_base_url,
+        api_key=api_key,
+        models=_models(settings.discovery_anthropic_models, "claude-haiku-5-5"),
+        supports_vision=True,
+    )
+
+
 _BUILDERS = {
     "gemini": gemini_provider,
+    "anthropic": anthropic_provider,
     "groq": groq_provider,
     "openrouter": openrouter_provider,
 }
@@ -358,8 +396,14 @@ async def generate_grounded_json(
     max_tokens: int = 8192,
     temperature: float | None = 0.2,
     timeout: float = 120.0,
+    skip_gemini_grounding: Optional[str] = None,
 ) -> GroundedAnswer[T]:
     """Grounded Gemini search, falling back to ungrounded Groq/OpenRouter.
+
+    ``skip_gemini_grounding`` is the reason grounding was already tried and
+    failed upstream (Discovery's web-search path runs in between): the grounded
+    call is not repeated — another 429 is all it would buy — and the reason is
+    what the notice reports.
 
     Gemini (when the org has a key) is tried first with Google Search. If it
     fails for any reason, the org's other providers answer the same prompt from
@@ -373,8 +417,10 @@ async def generate_grounded_json(
     if not keys:
         raise GeminiKeyMissing()
 
-    gemini_error: Optional[GeminiError] = None
-    if "gemini" in keys:
+    gemini_error: Optional[GeminiError] = (
+        GeminiError(skip_gemini_grounding) if skip_gemini_grounding else None
+    )
+    if "gemini" in keys and not skip_gemini_grounding:
         try:
             return await _grounded_gemini(
                 org_id, keys["gemini"], system=system, prompt=prompt, schema=schema,
@@ -416,6 +462,53 @@ async def generate_grounded_json(
             "live web search. They may be out of date or include companies that "
             "no longer exist — verify before outreach. Contact emails are omitted."
         ),
+    )
+
+
+async def generate_gemini_grounded_json(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    system: str,
+    prompt: str,
+    schema: type[T],
+    max_tokens: int = 8192,
+    temperature: float | None = 0.2,
+    timeout: float = 120.0,
+) -> GroundedAnswer[T]:
+    """Gemini with Google Search grounding and nothing else — no fallback.
+
+    For callers with their own next step (Discovery's web search). Raises
+    :class:`GeminiKeyMissing` without a Gemini key, :class:`GeminiError` when
+    the grounded call fails.
+    """
+    key = (await get_org_llm_keys(db, org_id)).get("gemini")
+    if not key:
+        raise GeminiKeyMissing()
+    return await _grounded_gemini(
+        org_id, key, system=system, prompt=prompt, schema=schema,
+        max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+    )
+
+
+async def generate_json_answer(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    system: str,
+    prompt: str,
+    schema: type[T],
+    max_tokens: int = 8192,
+    temperature: float | None = 0.2,
+    timeout: float = 60.0,
+) -> ChainAnswer[T]:
+    """:func:`generate_json`, also reporting which provider and model answered."""
+    keys = await get_org_llm_keys(db, org_id)
+    if not keys:
+        raise GeminiKeyMissing()
+    return await _chain_json(
+        org_id, discovery_providers(org_id, keys), system=system, prompt=prompt,
+        schema=schema, max_tokens=max_tokens, temperature=temperature, timeout=timeout,
     )
 
 

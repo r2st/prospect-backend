@@ -81,7 +81,9 @@ WARMUP_STEP = 5
 MAX_DAILY_LIMIT = 100
 BOUNCE_PAUSE_RATE = 0.05
 DRAFTS_PER_TICK = 5
-DISCOVERY_COMPANIES = 10
+# Per run. More than the old 10 now that a web search can supply real ones;
+# bounded by Hunter's credits (a find and a verify each per company).
+DISCOVERY_COMPANIES = 15
 # A prospect handed to a delayed send task holds this lease; past it, a task
 # that never ran (worker restart, broker loss) doesn't strand the prospect.
 SCHEDULE_LEASE = timedelta(hours=1)
@@ -775,22 +777,45 @@ async def _record_emailless(
     return added
 
 
-KNOWN_DOMAINS_IN_PROMPT = 40
+# Excluded from the next search. The model is shown the 40 most recent; the
+# whole list filters what comes back.
+KNOWN_DOMAINS_LIMIT = 200
+# Company.source values a discovery search writes ("tavily+gemini" style web
+# results are matched by their "+").
+DISCOVERY_SOURCES = ("gemini", "anthropic", "groq", "openrouter")
 
 
 async def _known_domains(db: AsyncSession) -> list[str]:
-    """Domains this org's campaigns already hold, most recent first (org-scoped read)."""
-    rows = (
+    """Domains this org has already found, most recent first (org-scoped read).
+
+    Two sources: companies a campaign holds a prospect row for, and companies
+    a discovery search created whether or not a row followed. The second is
+    what stopped the loop in production: 23 companies from early runs left no
+    prospect row, so they were never excluded and Groq returned the same
+    household names every day.
+    """
+    held = (
         await db.execute(
             select(Company.domain, func.max(CampaignProspect.created_at).label("seen"))
             .join(CampaignProspect, CampaignProspect.company_id == Company.id)
             .where(Company.domain.isnot(None))
             .group_by(Company.domain)
             .order_by(func.max(CampaignProspect.created_at).desc(), Company.domain)
-            .limit(KNOWN_DOMAINS_IN_PROMPT)
+            .limit(KNOWN_DOMAINS_LIMIT)
         )
     ).all()
-    return [d for d, _ in rows]
+    discovered = (
+        await db.execute(
+            select(Company.domain, Company.created_at)
+            .where(
+                Company.domain.isnot(None),
+                or_(Company.source.in_(DISCOVERY_SOURCES), Company.source.like("%+%")),
+            )
+            .order_by(Company.created_at.desc(), Company.id)
+            .limit(KNOWN_DOMAINS_LIMIT)
+        )
+    ).all()
+    return list(dict.fromkeys(d for d, _ in [*held, *discovered]))[:KNOWN_DOMAINS_LIMIT]
 
 
 async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
@@ -804,11 +829,6 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     # queue_contacts then drops as already prospected, so the campaign stalls
     # after day one. Tell the model what it has already given us.
     seen = await _known_domains(db)
-    if seen:
-        query = (
-            f"{query}\n\nDo not include any of these companies; they have already "
-            f"been found: {', '.join(seen)}."
-        )
     found = await gemini_discovery.search_companies(
         db,
         campaign.org_id,
@@ -819,6 +839,7 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
         min_employees=icp.company_size.min,
         max_employees=icp.company_size.max,
         limit=DISCOVERY_COMPANIES,
+        exclude_domains=seen,
     )
     result = await get_ingestion_service().ingest(db, found.records)
     company_ids = [o.company_id for o in result.outcomes if o.company_id]

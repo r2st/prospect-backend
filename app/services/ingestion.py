@@ -128,7 +128,7 @@ class ContactOutcome:
     record: ContactRecord
     contact: Optional[Contact] = None
     created: bool = False
-    # duplicate_email | suppressed | no_identity | None
+    # duplicate_email | duplicate_name | suppressed | no_identity | None
     reason: Optional[str] = None
 
 
@@ -411,6 +411,17 @@ class IngestionService:
                         )
                     )
                     continue
+            else:
+                # No address to dedup on: match the person by name at this
+                # company. Without this, every discovery run that returned the
+                # same company re-inserted its people — Stripe and Shopify
+                # each held 15 rows for 3 invented executives after five runs.
+                existing = await self._find_named_contact(db, company.id, cr)
+                if existing is not None:
+                    outcomes.append(
+                        ContactOutcome(record=cr, contact=existing, reason="duplicate_name")
+                    )
+                    continue
             contact = Contact(
                 company_id=company.id,
                 first_name=cr.first_name,
@@ -427,6 +438,23 @@ class IngestionService:
         if created_any:
             await db.flush()
         return outcomes
+
+    async def _find_named_contact(
+        self, db: AsyncSession, company_id, cr: ContactRecord
+    ) -> Optional[Contact]:
+        """An existing contact at ``company_id`` with the same first and last name."""
+        first = (cr.first_name or "").strip().lower()
+        last = (cr.last_name or "").strip().lower()
+        if not first and not last:
+            return None
+        stmt = select(Contact).where(
+            Contact.company_id == company_id,
+            func.lower(func.coalesce(Contact.first_name, "")) == first,
+            func.lower(func.coalesce(Contact.last_name, "")) == last,
+        )
+        return (
+            await db.execute(stmt.order_by(Contact.created_at, Contact.id).limit(1))
+        ).scalars().first()
 
     async def discover_contact_emails(
         self,

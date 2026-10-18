@@ -181,6 +181,16 @@ class Settings(BaseSettings):
     # Groq — free tier, very fast, generous per-day request cap.
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Claude as an optional Discovery provider, on the org's own Anthropic key,
+    # via Anthropic's OpenAI-compatible endpoint (so it goes through the same
+    # chat_completion chain as every other provider — no SDK client).
+    anthropic_openai_base_url: str = "https://api.anthropic.com/v1"
+    discovery_anthropic_models: str = "claude-haiku-5-5,claude-sonnet-5-5"
+    # Web search behind Discovery when Gemini's Google Search grounding is
+    # unavailable: the org's Tavily / Serper / Brave key finds pages, and an LLM
+    # reads only those pages. Queries per discovery run, and results per query.
+    discovery_web_queries: int = 4
+    discovery_web_results_per_query: int = 10
     groq_model: str = "llama-3.3-70b-versatile"
     # Cerebras — free tier, same Llama 3.3 70B under a different model id.
     cerebras_api_key: str = ""

@@ -474,6 +474,7 @@ async def _run_search(db_session, monkeypatch, hunter, companies, *, grounded=Tr
 
     async def fake_search(*a, **kw):
         _run_search.last_query = kw.get("query")
+        _run_search.last_exclude = kw.get("exclude_domains")
         return SimpleNamespace(records=[], provider="groq", grounded=_run_search.grounded)
 
     class FakeIngest:
@@ -811,8 +812,22 @@ async def test_discovery_tells_the_model_which_companies_it_already_found(db_ses
     await db_session.commit()
     co, _ = await _named(db_session, "fresh.com")
     await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
-    assert _run_search.last_query.startswith("We sell widgets")
-    assert "already.com" in _run_search.last_query
+    assert _run_search.last_query == "We sell widgets"
+    assert "already.com" in _run_search.last_exclude
+
+
+@pytest.mark.asyncio
+async def test_a_discovered_company_with_no_prospect_row_is_still_excluded(db_session, monkeypatch):
+    """Early runs left 23 companies with no prospect row; never excluded, Groq
+    returned the same household names every day."""
+    db_session.add(Company(name="Stripe", domain="stripe.com", source="groq"))
+    db_session.add(Company(name="Web Co", domain="webco.io", source="tavily+gemini"))
+    db_session.add(Company(name="Mine", domain="manual.com", source="manual"))
+    await db_session.commit()
+    co, _ = await _named(db_session, "fresh2.com")
+    await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
+    assert {"stripe.com", "webco.io"} <= set(_run_search.last_exclude)
+    assert "manual.com" not in _run_search.last_exclude
 
 
 @pytest.mark.asyncio

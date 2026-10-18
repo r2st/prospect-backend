@@ -96,8 +96,11 @@ async def test_groq_and_openrouter_keys_are_saved_per_provider(client, db_sessio
     assert g["has_key"] is True and "gsk_groq_2222" not in g["key_hint"]
 
     listing = (await client.get("/api/v1/settings/llm-keys")).json()
-    assert [k["provider"] for k in listing] == ["gemini", "groq", "openrouter"]
-    assert all(k["has_key"] for k in listing)
+    # LLMs in fallback order (Gemini default, Claude optional), then web search.
+    assert [k["provider"] for k in listing] == [
+        "gemini", "anthropic", "groq", "openrouter", "tavily", "serper", "brave"]
+    assert [k["kind"] for k in listing] == ["llm"] * 4 + ["search"] * 3
+    assert {k["provider"] for k in listing if k["has_key"]} == {"gemini", "groq", "openrouter"}
 
     keys = await org_gemini.get_org_llm_keys(db_session, APPREND_ORG_ID)
     assert keys == {"gemini": "gem-key-1111", "groq": "gsk_groq_2222", "openrouter": "sk-or-3333"}
@@ -110,7 +113,7 @@ async def test_deleting_groq_leaves_gemini(client, db_session):
     assert (await client.delete(URL, params={"provider": "groq"})).status_code == 204
     assert list(await org_gemini.get_org_llm_keys(db_session, APPREND_ORG_ID)) == ["gemini"]
     listing = (await client.get("/api/v1/settings/llm-keys")).json()
-    assert [k["has_key"] for k in listing] == [True, False, False]
+    assert [k["has_key"] for k in listing] == [True] + [False] * 6
 
 
 @pytest.mark.asyncio
