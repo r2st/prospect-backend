@@ -23,6 +23,15 @@ SATURDAY = datetime(2026, 10, 17, 18, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
+def _mx_valid(monkeypatch):
+    """Discovery checks a domain's MX before spending Hunter credits; never ask
+    real DNS from a test — the outcome would be a property of the network."""
+    from app.services import email_validation
+
+    monkeypatch.setattr(email_validation, "check_mx", lambda domain: "valid")
+
+
+@pytest.fixture(autouse=True)
 def _crypto_key():
     from cryptography.fernet import Fernet
 
@@ -427,11 +436,12 @@ def test_guess_email_is_firstname_at_domain(first, domain, expected):
 class _FakeHunter:
     """Stands in for HunterVerificationService: canned finder hits and verdicts."""
 
-    def __init__(self, *, enabled=True, finds=None, verdicts=None):
+    def __init__(self, *, enabled=True, finds=None, verdicts=None, people=None):
         self.enabled = enabled
         self.finds = finds or {}          # domain -> email
         self.verdicts = verdicts or {}    # email -> result
-        self.find_calls, self.verify_calls = [], []
+        self.people = people or {}        # domain -> domain-search entries
+        self.find_calls, self.verify_calls, self.domain_calls = [], [], []
 
     async def make_budget(self, db):
         return None
@@ -439,6 +449,12 @@ class _FakeHunter:
     async def find_email(self, db, company, first, last, *, budget=None):
         self.find_calls.append(company.domain)
         return self.finds.get(company.domain)
+
+    async def domain_search(self, db, domain, *, budget=None):
+        self.domain_calls.append(domain)
+        people = self.people.get(domain, [])
+        return {"status": "ok" if people else "not_found",
+                "email": people[0]["email"] if people else None, "emails": people}
 
     async def verify_contact(self, db, contact, *, budget=None):
         self.verify_calls.append(contact.email)
@@ -449,14 +465,16 @@ class _FakeHunter:
         return {"status": "ok", "result": result}
 
 
-async def _run_search(db_session, monkeypatch, hunter, companies):
+async def _run_search(db_session, monkeypatch, hunter, companies, *, grounded=True):
     from types import SimpleNamespace
 
     from app.services import gemini_discovery, hunter_verification, ingestion
 
+    _run_search.grounded = grounded
+
     async def fake_search(*a, **kw):
         _run_search.last_query = kw.get("query")
-        return SimpleNamespace(records=[], provider="groq")
+        return SimpleNamespace(records=[], provider="groq", grounded=_run_search.grounded)
 
     class FakeIngest:
         async def ingest(self, db, records):
@@ -933,3 +951,184 @@ async def test_resuming_a_campaign_sends_what_was_approved_while_paused(client, 
     # Pausing doesn't.
     await client.patch(f"/api/v1/campaigns/{c.id}", json={"status": "paused"})
     assert len(dispatched) == 1
+
+
+# ── where addresses come from: documents, own org, no-web search, MX ─────────
+
+async def _doc_campaign(db, candidates):
+    doc = DiscoveryDocument(filename="brief.txt", file_type="txt", size_bytes=10,
+                            status=STATUS_READY, content=b"brief",
+                            extracted={"candidates": candidates})
+    db.add(doc)
+    await db.commit()
+    return await _campaign(db, document_ids=[str(doc.id)])
+
+
+def _cand(cid, name, domain, *people):
+    return {"id": cid, "name": name, "domain": domain, "confidence": 1.0, "contacts": [
+        {"id": f"{cid}-p{i}", "first_name": f, "last_name": l, "email": e, "title": None}
+        for i, (f, l, e) in enumerate(people, 1)
+    ]}
+
+
+@pytest.mark.asyncio
+async def test_a_named_document_contact_without_an_email_goes_to_hunter(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    c = await _doc_campaign(db_session, [_cand("c1", "Named Co", "named.com", ("Priya", "Shah", None))])
+    hunter = _FakeHunter(finds={"named.com": "priya.shah@named.com"})
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: hunter)
+
+    assert await svc._seed_from_documents(db_session, c) == 1
+    assert hunter.find_calls == ["named.com"]
+    assert hunter.verify_calls == ["priya.shah@named.com"]
+    p = (await db_session.execute(select(CampaignProspect).where(
+        CampaignProspect.campaign_id == c.id))).scalars().one()
+    assert (p.to_email, p.source) == ("priya.shah@named.com", "document")
+
+
+@pytest.mark.asyncio
+async def test_document_emails_are_still_queued_as_given(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    c = await _doc_campaign(db_session, [
+        _cand("c1", "Mailed Co", "mailed.com", ("Ana", "Li", "ana@mailed.com"), ("Bo", "Ng", None)),
+    ])
+    hunter = _FakeHunter()
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: hunter)
+    assert await svc._seed_from_documents(db_session, c) == 1
+    # The company already has an address from the document: no credit spent on Bo.
+    assert hunter.find_calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_document_named_person_is_resolved_not_an_older_colleague(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    co = Company(name="Old Co", domain="old.com", source="manual")
+    db_session.add(co)
+    await db_session.flush()
+    older = Contact(company_id=co.id, first_name="Zed", last_name="Older")
+    db_session.add(older)
+    await db_session.commit()
+    c = await _doc_campaign(db_session, [_cand("c1", "Old Co", "old.com", ("Priya", "Shah", None))])
+    hunter = _FakeHunter(finds={"old.com": "priya@old.com"})
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: hunter)
+
+    await svc._seed_from_documents(db_session, c)
+    await db_session.refresh(older)
+    assert older.email is None
+    named = (await db_session.execute(select(Contact).where(
+        Contact.company_id == co.id, Contact.first_name == "Priya"))).scalars().one()
+    assert named.email == "priya@old.com"
+
+
+@pytest.mark.parametrize("address, own", [
+    ("sumaninster18@gmail.com", True),
+    ("suman.inster18@gmail.com", True),          # Gmail ignores dots
+    ("Suman.Inster18+test@googlemail.com", True),  # …and +tags, and the alias domain
+    ("someone.else@gmail.com", False),           # a free-mail sender doesn't own gmail.com
+])
+def test_canonical_address_matches_the_sending_mailbox(address, own):
+    assert (svc.canonical_address(address) == svc.canonical_address("sumaninster18@gmail.com")) is own
+
+
+@pytest.mark.asyncio
+async def test_the_orgs_own_addresses_are_never_queued(db_session):
+    c = await _campaign(db_session)
+    db_session.add(_gmail(email="sumaninster18@gmail.com"))
+    db_session.add(_gmail(email="founder@ourco.com"))
+    await db_session.commit()
+    # Free-mail contacts share a domain-less company: gmail.com is not one firm.
+    freemail = Company(name="Personal addresses", source="manual")
+    db_session.add(freemail)
+    await db_session.flush()
+    self_gmail = Contact(company_id=freemail.id, first_name="Suman", email="suman.inster18@gmail.com")
+    other_gmail = Contact(company_id=freemail.id, first_name="Lead", email="lead@gmail.com")
+    db_session.add_all([self_gmail, other_gmail])
+    await db_session.commit()
+    colleague = await _contact(db_session, "colleague@ourco.com")
+    stranger = await _contact(db_session, "lead@prospect.com")
+
+    queued = await svc.queue_contacts(
+        db_session, c, [self_gmail, colleague, stranger, other_gmail], source="document")
+    assert queued == 2
+    rows = (await db_session.execute(select(CampaignProspect.to_email).where(
+        CampaignProspect.campaign_id == c.id))).scalars().all()
+    assert sorted(rows) == ["lead@gmail.com", "lead@prospect.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_users_work_domain_is_excluded_too(db_session, make_user):
+    c = await _campaign(db_session)
+    await make_user("rep@ourteam.io")
+    teammate = await _contact(db_session, "teammate@ourteam.io")
+    assert await svc.queue_contacts(db_session, c, [teammate], source="document") == 0
+
+
+@pytest.mark.asyncio
+async def test_no_web_first_name_only_uses_domain_search_and_replaces_the_invented_name(
+    db_session, monkeypatch
+):
+    co, ct = await _named(db_session, "real.com", first="David", last=None)
+    hunter = _FakeHunter(people={"real.com": [
+        {"email": "maria.lopez@real.com", "type": "personal", "score": 92,
+         "first_name": "Maria", "last_name": "Lopez", "position": "CEO"},
+    ]})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co], grounded=False)
+    assert queued == 1
+    assert hunter.domain_calls == ["real.com"] and hunter.find_calls == []
+    await db_session.refresh(ct)
+    assert (ct.first_name, ct.last_name, ct.title, ct.email) == ("Maria", "Lopez", "CEO", "maria.lopez@real.com")
+    assert ct.email_verification_meta["email_origin"] == "hunter_domain_search"
+
+
+@pytest.mark.asyncio
+async def test_no_web_domain_search_finding_nobody_guesses_nothing(db_session, monkeypatch):
+    co, ct = await _named(db_session, "empty.com", first="Sarah", last=None)
+    hunter = _FakeHunter()
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co], grounded=False)
+    assert queued == 0
+    await db_session.refresh(ct)
+    assert ct.email is None  # no sarah@empty.com off an invented first name
+    assert hunter.verify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_grounded_or_full_name_results_still_use_the_finder(db_session, monkeypatch):
+    co1, _ = await _named(db_session, "web.com", first="David", last=None)
+    hunter = _FakeHunter(finds={"web.com": "david@web.com"})
+    await _run_search(db_session, monkeypatch, hunter, [co1], grounded=True)
+    assert hunter.domain_calls == []
+
+    co2, _ = await _named(db_session, "full.com", first="Priya", last="Shah")
+    hunter = _FakeHunter(finds={"full.com": "priya@full.com"})
+    await _run_search(db_session, monkeypatch, hunter, [co2], grounded=False)
+    assert hunter.domain_calls == [] and hunter.find_calls == ["full.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_domain_with_no_mail_server_spends_no_hunter_credit(db_session, monkeypatch):
+    from app.services import email_validation
+
+    monkeypatch.setattr(email_validation, "check_mx",
+                        lambda domain: "invalid" if domain == "dead.com" else "valid")
+    dead, dead_ct = await _named(db_session, "dead.com")
+    live, _ = await _named(db_session, "live.com", first="Ana", last="Li")
+    hunter = _FakeHunter(finds={"live.com": "ana@live.com"})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [dead, live])
+    assert hunter.find_calls == ["live.com"]
+    assert queued == 1
+    await db_session.refresh(dead_ct)
+    assert dead_ct.email is None  # no guess either: it would be a certain bounce
+
+
+@pytest.mark.asyncio
+async def test_an_mx_lookup_that_cant_complete_does_not_skip_the_domain(db_session, monkeypatch):
+    from app.services import email_validation
+
+    monkeypatch.setattr(email_validation, "check_mx", lambda domain: "unknown")
+    co, _ = await _named(db_session, "maybe.com")
+    hunter = _FakeHunter(finds={"maybe.com": "priya@maybe.com"})
+    await _run_search(db_session, monkeypatch, hunter, [co])
+    assert hunter.find_calls == ["maybe.com"]

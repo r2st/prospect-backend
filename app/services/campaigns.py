@@ -42,6 +42,7 @@ finally enforced by a partial unique index on mailed campaign prospects.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import random
@@ -329,18 +330,76 @@ async def previously_mailed(db: AsyncSession, emails: Iterable[str]) -> set[str]
     return {e for e in [*direct, *sequence, *campaign] if e}
 
 
+def canonical_address(email: Optional[str]) -> Optional[str]:
+    """The mailbox an address reaches, for "is this us?" comparisons.
+
+    Strips a ``+tag`` everywhere, and Gmail's ignored dots: the E2E campaign's
+    test contact ``suman.inster18@gmail.com`` *was* the sending mailbox
+    ``sumaninster18@gmail.com``, and a plain string compare said otherwise.
+    """
+    if not email or "@" not in email:
+        return None
+    local, _, domain = email.strip().lower().rpartition("@")
+    local = local.split("+", 1)[0]
+    if domain == "googlemail.com":
+        domain = "gmail.com"
+    if domain == "gmail.com":
+        local = local.replace(".", "")
+    return f"{local}@{domain}" if local and domain else None
+
+
+async def own_addresses(db: AsyncSession) -> tuple[set[str], set[str]]:
+    """``(domains, mailboxes)`` that belong to this org: never prospects.
+
+    A document an operator uploads usually carries their own signature — a
+    partner brief names the author — and nothing stopped that address being
+    queued and mailed by the org's own campaign. Sources: every connected
+    sending account (Gmail and SMTP) and every user of the org. A work domain
+    excludes the whole domain (a colleague is not a prospect); a free-mail
+    host can't — everyone at gmail.com is not one company — so for those only
+    the exact mailbox is excluded, canonicalised.
+    """
+    from app.dependencies import scope_users_to_current_org
+    from app.models.smtp_account import SmtpAccount
+    from app.services.crm_import import FREE_EMAIL_DOMAINS
+
+    emails = [
+        *(await db.execute(select(GmailAccount.email))).scalars().all(),
+        *(await db.execute(select(SmtpAccount.email))).scalars().all(),
+        *(await db.execute(scope_users_to_current_org(select(User.email)))).scalars().all(),
+    ]
+    domains: set[str] = set()
+    mailboxes: set[str] = set()
+    for e in emails:
+        canon = canonical_address(e)
+        if not canon:
+            continue
+        domain = canon.rpartition("@")[2]
+        if domain in FREE_EMAIL_DOMAINS or domain == "googlemail.com":
+            mailboxes.add(canon)
+        else:
+            domains.add(domain)
+    return domains, mailboxes
+
+
 async def queue_contacts(
     db: AsyncSession, campaign: Campaign, contacts: list[Contact], *, source: str
 ) -> int:
     """Queue contacts as prospects. Returns how many were newly queued.
 
     Silently passes over anyone without an email, on the do-not-contact list or
-    flagged, already a prospect of *any* campaign, or already mailed by any path.
+    flagged, already a prospect of *any* campaign, already mailed by any path,
+    or belonging to this org itself (:func:`own_addresses`).
     """
+    own_domains, own_mailboxes = await own_addresses(db)
     candidates: dict[str, Contact] = {}
     for c in contacts:
         email = (c.email or "").strip().lower()
         if not email or suppression.blocking_flag(c) is not None or email in candidates:
+            continue
+        canon = canonical_address(email)
+        if canon in own_mailboxes or (canon or "").rpartition("@")[2] in own_domains:
+            logger.info("Campaign %s: not queueing %s — it is this org's own address", campaign.id, email)
             continue
         candidates[email] = c
     if not candidates:
@@ -377,7 +436,15 @@ async def queue_contacts(
 # Discovery
 # ---------------------------------------------------------------------------
 async def _seed_from_documents(db: AsyncSession, campaign: Campaign) -> int:
-    """Queue the contacts (with emails) already found in the campaign's documents."""
+    """Queue the people the campaign's documents name.
+
+    Contacts the document gives an address for are queued as they are. A
+    company the document names people at but gives no address for gets one of
+    those people — the first plausible name — run through the same
+    finder → guess → verify path as search results. These are the operator's
+    own leads, written down by them, and they used to be dropped for want of
+    an email.
+    """
     from app.services import discovery_documents
 
     ids = [uuid.UUID(str(i)) for i in campaign.document_ids or []]
@@ -387,22 +454,66 @@ async def _seed_from_documents(db: AsyncSession, campaign: Campaign) -> int:
         await db.execute(select(DiscoveryDocument).where(DiscoveryDocument.id.in_(ids)))
     ).scalars().all()
     contact_ids: set[str] = set()
+    named: list[tuple[uuid.UUID, str, Optional[str]]] = []
     for doc in docs:
         cands = [
-            c["id"] for c in ((doc.extracted or {}).get("candidates") or [])
-            if any(p.get("email") for p in c.get("contacts", []))
+            c for c in ((doc.extracted or {}).get("candidates") or [])
+            if any(p.get("email") or p.get("first_name") for p in c.get("contacts", []))
         ]
-        if cands:
-            result = await discovery_documents.import_candidates(db, doc, cands)
-            contact_ids |= set(result.get("contact_ids") or [])
-    if not contact_ids:
-        return 0
-    contacts = (
-        await db.execute(
-            select(Contact).where(Contact.id.in_([uuid.UUID(c) for c in contact_ids]))
+        if not cands:
+            continue
+        result = await discovery_documents.import_candidates(db, doc, [c["id"] for c in cands])
+        contact_ids |= set(result.get("contact_ids") or [])
+        wanted = {c["id"] for c in cands}
+        # import_candidates stamps imported_company_id on the stored candidates.
+        for cand in (doc.extracted or {}).get("candidates") or []:
+            people = cand.get("contacts", [])
+            if cand["id"] not in wanted or not cand.get("imported_company_id"):
+                continue
+            if any(p.get("email") for p in people):
+                continue  # the document already gives this company an address
+            person = next(
+                (p for p in people if plausible_person_name(p.get("first_name"), p.get("last_name"))),
+                None,
+            )
+            if person is not None:
+                named.append((uuid.UUID(cand["imported_company_id"]),
+                              person["first_name"], person.get("last_name")))
+
+    contacts = list(
+        (
+            await db.execute(
+                select(Contact).where(Contact.id.in_([uuid.UUID(c) for c in contact_ids]))
+            )
+        ).scalars().all()
+    ) if contact_ids else []
+
+    targets: list[tuple[Company, Contact]] = []
+    for company_id, first, last in named:
+        company = await db.get(Company, company_id)
+        if company is None or not company.domain:
+            continue
+        # The person the document named, not whoever is oldest at a company the
+        # import matched to an existing row.
+        stmt = select(Contact).where(
+            Contact.company_id == company_id,
+            func.lower(Contact.first_name) == first.strip().lower(),
         )
-    ).scalars().all()
-    return await queue_contacts(db, campaign, list(contacts), source="document")
+        if last:
+            stmt = stmt.where(func.lower(Contact.last_name) == last.strip().lower())
+        contact = (
+            await db.execute(stmt.order_by(Contact.created_at, Contact.id).limit(1))
+        ).scalars().first()
+        if contact is None:
+            continue
+        if contact.email:
+            contacts.append(contact)
+        else:
+            targets.append((company, contact))
+    if targets:
+        _, addressed = await _address_contacts(db, targets)
+        contacts.extend(addressed)
+    return await queue_contacts(db, campaign, contacts, source="document")
 
 
 def guess_email(first_name: Optional[str], domain: Optional[str]) -> Optional[str]:
@@ -471,20 +582,18 @@ def _stamp_origin(contact: Contact, origin: str) -> None:
     contact.email_verification_meta = meta
 
 
-async def _resolve_missing_emails(db: AsyncSession, company_ids: list[uuid.UUID]) -> dict[str, int]:
+async def _resolve_missing_emails(
+    db: AsyncSession, company_ids: list[uuid.UUID], *, grounded: bool = True
+) -> dict[str, int]:
     """Give one named contact per address-less company an address, then verify it.
 
-    Discovery LLMs name people reliably and their addresses almost never. Order:
-    Hunter's Email Finder (the address the person actually uses), falling back
-    to a ``firstname@domain`` guess; either way Hunter's verifier then decides
-    whether it is sendable. Only one contact per company is tried, because only
-    one per company is ever queued and the free Hunter tier is 25 finds a month.
-    Every Hunter call fails open: no key, no budget or an outage leaves the
-    address unverified, which ``schedule_sends`` will not send.
+    Discovery LLMs name people reliably and their addresses almost never. Only
+    one contact per company is tried, because only one per company is ever
+    queued and Hunter's free tier is a few dozen finds a month. ``grounded`` is
+    False when the search answered from training data (no web access); see
+    :func:`_address_contacts`.
     """
-    from app.services import hunter_verification
-
-    stats = {"found": 0, "guessed": 0, "verified": 0}
+    stats = {"found": 0, "guessed": 0, "verified": 0, "domain_searched": 0, "no_mx": 0}
     companies = (
         await db.execute(
             select(Company).where(Company.id.in_(company_ids), Company.domain.isnot(None))
@@ -525,17 +634,65 @@ async def _resolve_missing_emails(db: AsyncSession, company_ids: list[uuid.UUID]
             )
     if not targets:
         return stats
+    stats, _ = await _address_contacts(db, targets, grounded=grounded)
+    return stats
 
+
+async def _address_contacts(
+    db: AsyncSession, targets: list[tuple[Company, Contact]], *, grounded: bool = True
+) -> tuple[dict[str, int], list[Contact]]:
+    """Find, guess or replace an address for each ``(company, contact)``, then verify.
+
+    Returns stats and the contacts that ended up with an address.
+
+    * **MX first.** A domain that can't receive mail is skipped before any
+      Hunter call — the finder spends a credit on a dead domain just as
+      readily as on a live one, and a guess there is a certain bounce. Only a
+      definite ``invalid`` skips: ``unknown`` (DNS down, dnspython missing) says
+      nothing about the domain.
+    * **No-web results with a first name only get a domain search.** A search
+      answered from training data invents its people: the E2E campaign's
+      Groq run named "David", "Sarah"… and nine of ten guesses came back
+      undeliverable. The finder can't find an invented person, so instead one
+      domain-search credit returns the people Hunter knows at that domain, and
+      the best one *replaces* the invented contact. Nothing found means no
+      address — no ``firstname@`` guess off a made-up first name.
+    * Otherwise Hunter's Email Finder, falling back to a ``firstname@domain``
+      guess. Either way Hunter's verifier decides whether it is sendable.
+
+    Every Hunter call fails open: no key, no budget or an outage leaves the
+    address unverified, which ``schedule_sends`` will not send.
+    """
+    from app.services import email_validation, hunter_verification
+
+    stats = {"found": 0, "guessed": 0, "verified": 0, "domain_searched": 0, "no_mx": 0}
+    addressed: list[Contact] = []
     hunter = hunter_verification.get_hunter_service()
     budget = await hunter.make_budget(db) if hunter.enabled else None
     for company, contact in targets:
+        if await asyncio.to_thread(email_validation.check_mx, company.domain) == "invalid":
+            stats["no_mx"] += 1
+            logger.info("Campaign discovery: %s has no mail server — not searching", company.domain)
+            continue
         email, origin = None, "pattern"
-        if hunter.enabled:
+        if hunter.enabled and not grounded and not (contact.last_name or "").strip():
+            stats["domain_searched"] += 1
+            found = await hunter.domain_search(db, company.domain, budget=budget)
+            best = (found.get("emails") or [None])[0]
+            if not best or not best.get("email") or await _address_taken(db, best["email"], contact.id):
+                continue
+            email, origin = best["email"], "hunter_domain_search"
+            if best.get("first_name"):
+                contact.first_name = best["first_name"]
+                contact.last_name = best.get("last_name")
+                contact.title = best.get("position") or contact.title
+        elif hunter.enabled:
             email = await hunter.find_email(
                 db, company, contact.first_name, contact.last_name, budget=budget
             )
+            if email:
+                origin = "hunter_finder"
         if email:
-            origin = "hunter_finder"
             contact.email = email.strip().lower()
             stats["found"] += 1
         else:
@@ -550,9 +707,21 @@ async def _resolve_missing_emails(db: AsyncSession, company_ids: list[uuid.UUID]
                 stats["verified"] += 1
         # After verifying: a verdict replaces the meta wholesale.
         _stamp_origin(contact, origin)
+        addressed.append(contact)
     await db.flush()
     logger.info("Campaign discovery emails: %s", stats)
-    return stats
+    return stats, addressed
+
+
+async def _address_taken(db: AsyncSession, email: str, contact_id: uuid.UUID) -> bool:
+    """Whether another contact already holds this address (contacts dedup by email)."""
+    return (
+        await db.execute(
+            select(Contact.id).where(
+                func.lower(Contact.email) == email.strip().lower(), Contact.id != contact_id
+            ).limit(1)
+        )
+    ).first() is not None
 
 
 async def _record_emailless(
@@ -648,7 +817,7 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     if not company_ids:
         return 0
     company_ids = list(dict.fromkeys(company_ids))
-    await _resolve_missing_emails(db, company_ids)
+    await _resolve_missing_emails(db, company_ids, grounded=getattr(found, "grounded", True))
     rows = (
         await db.execute(
             select(Contact)
