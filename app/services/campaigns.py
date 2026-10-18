@@ -382,6 +382,15 @@ async def own_addresses(db: AsyncSession) -> tuple[set[str], set[str]]:
     return domains, mailboxes
 
 
+def is_own_address(email: Optional[str], own: tuple[set[str], set[str]]) -> bool:
+    """Whether ``email`` is one of :func:`own_addresses`' ``(domains, mailboxes)``."""
+    canon = canonical_address(email)
+    if not canon:
+        return False
+    domains, mailboxes = own
+    return canon in mailboxes or canon.rpartition("@")[2] in domains
+
+
 async def queue_contacts(
     db: AsyncSession, campaign: Campaign, contacts: list[Contact], *, source: str
 ) -> int:
@@ -391,14 +400,13 @@ async def queue_contacts(
     flagged, already a prospect of *any* campaign, already mailed by any path,
     or belonging to this org itself (:func:`own_addresses`).
     """
-    own_domains, own_mailboxes = await own_addresses(db)
+    own = await own_addresses(db)
     candidates: dict[str, Contact] = {}
     for c in contacts:
         email = (c.email or "").strip().lower()
         if not email or suppression.blocking_flag(c) is not None or email in candidates:
             continue
-        canon = canonical_address(email)
-        if canon in own_mailboxes or (canon or "").rpartition("@")[2] in own_domains:
+        if is_own_address(email, own):
             logger.info("Campaign %s: not queueing %s — it is this org's own address", campaign.id, email)
             continue
         candidates[email] = c
@@ -1351,6 +1359,15 @@ async def send_prospect(
         return SendOutcome("skipped", p.skip_reason)
     if email in await previously_mailed(db, [email]):
         p.status, p.skip_reason = "skipped", "Already emailed — never sent twice"
+        await db.commit()
+        return SendOutcome("skipped", p.skip_reason)
+    # queue_contacts already refuses these; this catches a row queued before
+    # that check existed (the Partner Brief campaign had the org's own CEO
+    # approved and due Monday 09:00), or before a mailbox on that domain was
+    # connected. The last gate before the wire, so both the tick and the
+    # instant send pass through it.
+    if is_own_address(email, await own_addresses(db)):
+        p.status, p.skip_reason = "skipped", "This organization's own address — not a prospect"
         await db.commit()
         return SendOutcome("skipped", p.skip_reason)
 

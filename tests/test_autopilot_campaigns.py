@@ -1132,3 +1132,39 @@ async def test_an_mx_lookup_that_cant_complete_does_not_skip_the_domain(db_sessi
     hunter = _FakeHunter(finds={"maybe.com": "priya@maybe.com"})
     await _run_search(db_session, monkeypatch, hunter, [co])
     assert hunter.find_calls == ["maybe.com"]
+
+
+@pytest.mark.parametrize("to_email", [
+    "ceo@ourco.com",              # the org's work domain — the Partner Brief case
+    "suman.inster18@gmail.com",   # the free-mail sending mailbox, under Gmail's dots
+])
+@pytest.mark.asyncio
+async def test_an_own_address_queued_before_the_filter_is_refused_at_send_time(
+    db_session, monkeypatch, to_email
+):
+    """queue_contacts refuses these now; a row approved before it did — the org's
+    own CEO, due Monday 09:00 — must still never reach the wire."""
+    c = await _campaign(db_session)
+    db_session.add_all([_gmail(email="founder@ourco.com"), _gmail(email="sumaninster18@gmail.com")])
+    freemail = Company(name="Personal addresses", source="manual")
+    db_session.add(freemail)
+    await db_session.flush()
+    ct = Contact(company_id=freemail.id, first_name="Own", email=to_email,
+                 email_verification_result="deliverable", email_verified_at=MIDWEEK)
+    db_session.add(ct)
+    await db_session.flush()
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=to_email,
+                         status="approved", email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    sent = []
+
+    async def fake_send(db, **kw):
+        sent.append(kw)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    out = await svc.send_prospect(db_session, p.id, MIDWEEK)
+    assert out.status == "skipped" and sent == []
+    await db_session.refresh(p)
+    assert p.status == "skipped" and "own address" in p.skip_reason
