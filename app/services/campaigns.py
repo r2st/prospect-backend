@@ -475,6 +475,64 @@ async def queue_contacts_detailed(
     return queued, skipped
 
 
+async def contact_block_reason(
+    db: AsyncSession, contact: Contact, *, exclude_prospect_id: Optional[uuid.UUID] = None
+) -> Optional[str]:
+    """Why ``contact`` can't be a prospect (a :data:`SKIP_REASONS` key), or None.
+
+    The same rules :func:`queue_contacts_detailed` applies when a contact is
+    first queued, for a prospect whose contact was edited in place — a changed
+    address has to clear do-not-contact, own-org and "never twice" again.
+    """
+    email = (contact.email or "").strip().lower()
+    if not email:
+        return "no_email"
+    if suppression.blocking_flag(contact) is not None or email in await suppression.suppressed_addresses(db, {email}):
+        return "blocked"
+    if is_own_address(email, await own_addresses(db)):
+        return "own_org"
+    if email in await previously_mailed(db, [email]):
+        return "already_mailed"
+    stmt = select(CampaignProspect.id).where(CampaignProspect.to_email == email)
+    if exclude_prospect_id is not None:
+        stmt = stmt.where(CampaignProspect.id != exclude_prospect_id)
+    if (await db.execute(stmt.limit(1))).first() is not None:
+        return "already_prospect"
+    return None
+
+
+UNSENT = ("queued", "draft_created", "approved", "no_email", "skipped", "failed")
+
+
+def reset_for_redraft(p: CampaignProspect) -> None:
+    """Back to ``queued`` with no draft: the next pass verifies and drafts it again."""
+    p.status = "queued"
+    p.email_subject = p.email_body = None
+    p.approved_at = p.scheduled_for = None
+    p.skip_reason = p.error = None
+
+
+async def redraft(db: AsyncSession, campaign: Campaign) -> int:
+    """Discard the unsent, unapproved drafts so they are written again.
+
+    For after the campaign's template (or its mode) changes: drafts written
+    before the change don't follow it. Approved emails are left alone — the
+    operator signed off on that copy — and nothing sent is ever touched.
+    """
+    rows = (
+        await db.execute(
+            select(CampaignProspect).where(
+                CampaignProspect.campaign_id == campaign.id,
+                CampaignProspect.status == "draft_created",
+            )
+        )
+    ).scalars().all()
+    for p in rows:
+        reset_for_redraft(p)
+    await db.flush()
+    return len(rows)
+
+
 async def add_contacts(
     db: AsyncSession, campaign: Campaign, contacts: list[Contact], *, source: str
 ) -> dict:
@@ -1417,6 +1475,35 @@ async def sending_account(db: AsyncSession, campaign: Campaign):
     if acct is None or acct.status != "connected" or not acct.sending_enabled:
         return None
     return acct
+
+
+async def sender_summary(db: AsyncSession, campaign: Campaign) -> Optional[dict]:
+    """The campaign's mailbox for display, whether or not it can send right now.
+
+    :func:`sending_account` answers "can we send?" and returns None for a
+    disconnected mailbox; the preview needs to say *which* mailbox and *why* it
+    can't, so this loads the stored account regardless of its state.
+    """
+    from app.models.smtp_account import SmtpAccount
+
+    if campaign.gmail_account_id is not None:
+        kind, acct = "gmail", await db.get(GmailAccount, campaign.gmail_account_id)
+    elif campaign.smtp_account_id is not None:
+        kind, acct = "smtp", await db.get(SmtpAccount, campaign.smtp_account_id)
+    else:
+        return None
+    if acct is None:
+        return None
+    problem = None
+    if acct.status != "connected":
+        problem = "disconnected"
+    elif not acct.sending_enabled:
+        problem = "sending_off"
+    return {
+        "id": str(acct.id), "kind": kind, "email": acct.email,
+        "display_name": getattr(acct, "display_name", None),
+        "ready": problem is None, "problem": problem,
+    }
 
 
 async def verify_prospects(db: AsyncSession, campaign: Campaign) -> dict[str, int]:

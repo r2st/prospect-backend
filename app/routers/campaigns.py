@@ -130,6 +130,8 @@ class CampaignDetail(CampaignOut):
     daily: list[dict[str, Any]]
     # Filenames every email of this campaign carries (documents + template files).
     attachments: list[str] = []
+    # The mailbox drafts go out from: {id, kind, email, display_name, ready, problem}.
+    sender: Optional[dict[str, Any]] = None
 
 
 class ProspectOut(BaseModel):
@@ -153,6 +155,13 @@ class ProspectOut(BaseModel):
     email_subject: Optional[str] = None
     email_body: Optional[str] = None
     gmail_message_id: Optional[str] = None
+    company_domain: Optional[str] = None
+    contact_first_name: Optional[str] = None
+    contact_last_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    # The address a sent email actually went out from (EmailSend.from_email);
+    # None until it is sent. Drafts go out from the campaign's sender.
+    sent_from: Optional[str] = None
     sent_at: Optional[datetime] = None
     replied_at: Optional[datetime] = None
     bounced_at: Optional[datetime] = None
@@ -608,7 +617,8 @@ async def get_campaign(
         for log in logs
     ]
     return {**_out(c), "metrics": await _metrics(db, c), "daily": daily,
-            "attachments": await svc.attachment_names(db, c)}
+            "attachments": await svc.attachment_names(db, c),
+            "sender": await svc.sender_summary(db, c)}
 
 
 @router.patch("/{campaign_id}", response_model=CampaignOut)
@@ -725,30 +735,42 @@ async def list_prospects(
 
     company_ids = {p.company_id for p in rows if p.company_id}
     contact_ids = {p.contact_id for p in rows if p.contact_id}
-    companies = {
-        cid: name for cid, name in (
-            await db.execute(select(Company.id, Company.name).where(Company.id.in_(company_ids)))
-        ).all()
-    } if company_ids else {}
+    company_rows = (
+        await db.execute(select(Company.id, Company.name, Company.domain).where(Company.id.in_(company_ids)))
+    ).all() if company_ids else []
+    companies = {r.id: r.name for r in company_rows}
+    domains = {r.id: r.domain for r in company_rows}
     contact_rows = (
         await db.execute(
             select(
-                Contact.id, Contact.first_name, Contact.last_name,
+                Contact.id, Contact.first_name, Contact.last_name, Contact.title,
                 Contact.email_verification_result, Contact.email_verification_meta,
             ).where(Contact.id.in_(contact_ids))
         )
     ).all() if contact_ids else []
+    people = {r.id: r for r in contact_rows}
     contacts = {r.id: " ".join(x for x in (r.first_name, r.last_name) if x) or None for r in contact_rows}
     verdicts = {
         r.id: (r.email_verification_result, (r.email_verification_meta or {}).get("email_origin"))
         for r in contact_rows
     }
 
+    from app.models.email_template import EmailSend
+
+    send_ids = [p.email_send_id for p in rows if p.email_send_id]
+    sent_from = dict(
+        (await db.execute(select(EmailSend.id, EmailSend.from_email).where(EmailSend.id.in_(send_ids)))).all()
+    ) if send_ids else {}
+
     items = [
         ProspectOut(
             id=p.id, campaign_id=p.campaign_id,
             company_id=p.company_id, company_name=companies.get(p.company_id),
+            company_domain=domains.get(p.company_id),
             contact_id=p.contact_id, contact_name=contacts.get(p.contact_id),
+            contact_first_name=getattr(people.get(p.contact_id), "first_name", None),
+            contact_last_name=getattr(people.get(p.contact_id), "last_name", None),
+            contact_title=getattr(people.get(p.contact_id), "title", None),
             to_email=p.to_email,
             email_verification=verdicts.get(p.contact_id, (None, None))[0],
             email_verified=verdicts.get(p.contact_id, (None, None))[0] == svc.VERIFIED,
@@ -757,6 +779,7 @@ async def list_prospects(
             skip_reason=p.skip_reason, error=p.error,
             email_subject=p.email_subject, email_body=p.email_body,
             gmail_message_id=p.gmail_message_id,
+            sent_from=sent_from.get(p.email_send_id),
             sent_at=p.sent_at, replied_at=p.replied_at, bounced_at=p.bounced_at,
             created_at=p.created_at,
         )
@@ -979,4 +1002,118 @@ async def get_campaign_attachment(
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
         },
+    )
+
+
+
+@router.post("/{campaign_id}/redraft")
+async def redraft_campaign(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Rewrite the unapproved drafts — after choosing or changing the template.
+
+    Approved and sent emails are left exactly as they are.
+    """
+    c = await _get_campaign(db, campaign_id, user)
+    _require_open(c)
+    count = await svc.redraft(db, c)
+    await db.commit()
+    return {"redrafting": count, "processing": _dispatch_processing(c) if count else "nothing_queued"}
+
+
+class ProspectContactIn(BaseModel):
+    """The person behind one prospect, as the operator wants them."""
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    title: Optional[str] = Field(None, max_length=255)
+    email: Optional[str] = Field(None, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: Optional[str]) -> Optional[str]:
+        from app.services.email_validation import is_valid_syntax
+
+        v = (v or "").strip().lower() or None
+        if v is not None and not is_valid_syntax(v):
+            raise ValueError("That doesn't look like an email address.")
+        return v
+
+
+_SENT_STATES = ("sending", "sent", "replied", "bounced")
+
+
+@router.put("/{campaign_id}/prospects/{prospect_id}/contact", response_model=AddProspectsOut)
+async def set_prospect_contact(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: ProspectContactIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Edit the person behind a prospect, or add one where discovery found nobody.
+
+    Writes the shared contact record (it is the same person everywhere). A new
+    or changed address loses its Hunter verdict and is verified again, and has
+    to clear the do-not-contact, own-org and "never twice" rules like any newly
+    queued contact. A changed name or address throws away an unapproved draft,
+    which greeted the old one; a title change alone keeps it. Nothing already
+    sent can be edited: the record of what went out stays true.
+    """
+    c = await _get_campaign(db, campaign_id, user)
+    _require_open(c)
+    p = await _get_prospect(db, c, prospect_id)
+    if p.status in _SENT_STATES:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This email has already been sent; its contact can't be changed.")
+    contact = await db.get(Contact, p.contact_id) if p.contact_id else None
+    if contact is None:
+        if p.company_id is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This prospect has no company to add a contact to.")
+        contact = Contact(company_id=p.company_id, source="manual")
+        db.add(contact)
+    old = ((contact.first_name or "").strip().lower(), (contact.last_name or "").strip().lower(),
+           (contact.email or "").strip().lower())
+    if payload.email and payload.email != old[2]:
+        taken = (await db.execute(
+            select(Contact.id).where(func.lower(Contact.email) == payload.email,
+                                     Contact.id != contact.id).limit(1)
+        )).first()
+        if taken is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                "Another contact already has this email address — add that contact instead.")
+    contact.first_name = payload.first_name.strip()
+    contact.last_name = (payload.last_name or "").strip() or None
+    contact.title = (payload.title or "").strip() or None
+    email_changed = (payload.email or "") != old[2]
+    if email_changed:
+        contact.email = payload.email
+        # A verdict is about an address; this is a different one.
+        contact.email_verification_result = None
+        contact.email_verified_at = None
+        contact.email_verification_meta = {"email_origin": "manual"}
+    await db.flush()
+    p.contact_id = contact.id
+
+    reason = await svc.contact_block_reason(db, contact, exclude_prospect_id=p.id)
+    named_changed = (contact.first_name.lower(), (contact.last_name or "").lower()) != old[:2]
+    queued = 0
+    if reason is not None:
+        p.status = "no_email" if reason == "no_email" else "skipped"
+        p.to_email = contact.email if reason != "no_email" else None
+        p.email_subject = p.email_body = None
+        p.approved_at = p.scheduled_for = None
+        p.skip_reason = svc.SKIP_REASONS[reason]
+    elif email_changed or named_changed or p.status in ("no_email", "skipped", "failed", "queued"):
+        p.to_email = contact.email
+        svc.reset_for_redraft(p)
+        queued = 1
+    await db.commit()
+    skipped = [] if reason is None else [{
+        "contact_id": str(contact.id), "email": contact.email,
+        "reason": reason, "label": svc.SKIP_REASONS[reason],
+    }]
+    return AddProspectsOut(
+        queued=queued, skipped=skipped,
+        processing=_dispatch_processing(c) if queued else "nothing_queued",
     )
