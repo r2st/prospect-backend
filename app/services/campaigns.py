@@ -66,7 +66,7 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.discovery_document import DiscoveryDocument
 from app.models.email_reply import EmailReply
-from app.models.email_template import WIRE_STATUSES, EmailSend
+from app.models.email_template import WIRE_STATUSES, EmailSend, EmailTemplate
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.tenant import Organization
@@ -1089,7 +1089,8 @@ _PLACEHOLDER = re.compile(r"\[[^\]]{2,40}\]|\{\{|\}\}|<[A-Z][A-Z _]{2,}>")
 
 
 def draft_prompt(campaign: Campaign, contact: Optional[Contact], company: Optional[Company],
-                 sender_name: str, sender_org: str) -> str:
+                 sender_name: str, sender_org: str,
+                 template: Optional["EmailTemplate"] = None) -> str:
     icp = Icp.model_validate(campaign.icp_json or {})
     who = " ".join(p for p in [getattr(contact, "first_name", None), getattr(contact, "last_name", None)] if p)
     lines = [
@@ -1110,6 +1111,14 @@ def draft_prompt(campaign: Campaign, contact: Optional[Contact], company: Option
         )
         if company.domain:
             lines.append(f"Website: {company.domain}")
+    if template is not None:
+        lines.append("")
+        lines.append(
+            "Base the email on this template: keep its message, structure, offer and call "
+            "to action, and personalise it for this prospect. Fill or drop any {{merge}} "
+            "fields; never leave one in the output.\n"
+            f"Template subject: {template.subject}\nTemplate body:\n{html_to_text(template.body)}"
+        )
     lines.append("")
     lines.append(
         "Write a first-touch cold email: 60-120 words, a subject under 8 words, open with "
@@ -1118,6 +1127,77 @@ def draft_prompt(campaign: Campaign, contact: Optional[Contact], company: Option
         f"sender's first name only.\n\nReturn: {{\"subject\": str, \"body\": str}}"
     )
     return "\n".join(lines)
+
+
+_BLOCK_END = re.compile(r"</(p|div|h[1-6]|li|tr)\s*>", re.IGNORECASE)
+_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_TAG = re.compile(r"<[^>]+>")
+
+
+def html_to_text(body: str) -> str:
+    """A template's HTML body as the plain text campaign drafts are kept in.
+
+    Drafts are edited and previewed as text and turned back into HTML at send
+    (:func:`body_to_html`), so a template body is flattened the same way a
+    human would read it: paragraphs to blank lines, ``<br>`` to newlines.
+    """
+    text = _BR.sub("\n", body or "")
+    text = _BLOCK_END.sub("\n\n", text)
+    text = html.unescape(_TAG.sub("", text))
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+TEMPLATE_MODES = ("ai", "template", "ai_template")
+
+
+async def campaign_template(db: AsyncSession, campaign: Campaign) -> Optional[EmailTemplate]:
+    """The template drafts use, or None (AI mode, or the template is gone/archived)."""
+    if campaign.template_mode == "ai" or campaign.template_id is None:
+        return None
+    t = await db.get(EmailTemplate, campaign.template_id)
+    return None if t is None or t.is_archived else t
+
+
+def render_template_draft(
+    template: EmailTemplate, contact: Optional[Contact], company: Optional[Company]
+) -> tuple[str, str]:
+    """``(subject, body)`` for one prospect: merge fields filled, no AI.
+
+    The same rendering the template router's preview and compose use (sandboxed
+    Jinja, the "there" greeting fallback, subject clean-up), so a template reads
+    the same everywhere. An unknown merge field renders empty; anything left
+    that still looks like a placeholder sends the draft to review.
+    """
+    from app.services.email_compose import (
+        build_merge_context, clean_body, clean_subject, render, subject_context,
+    )
+
+    ctx = build_merge_context(contact, company)
+    subject = clean_subject(render(template.subject, subject_context(ctx)))
+    body = html_to_text(clean_body(render(template.body, ctx)))
+    return subject, body
+
+
+def generalize_draft(text: str, contact: Optional[Contact], company: Optional[Company]) -> str:
+    """Turn one prospect's draft back into a template: their details → merge fields.
+
+    Longest first, so "Gart Solutions" is replaced before a first name that
+    happens to appear inside it; whole words only, so "Ana" doesn't eat "Analytics".
+    """
+    pairs = [
+        (getattr(company, "name", None), "{{company}}"),
+        (getattr(contact, "title", None), "{{contact_title}}"),
+        (" ".join(p for p in [getattr(contact, "first_name", None), getattr(contact, "last_name", None)] if p),
+         "{{full_name}}"),
+        (getattr(contact, "last_name", None), "{{last_name}}"),
+        (getattr(contact, "first_name", None), "{{first_name}}"),
+    ]
+    out = text or ""
+    for value, field in sorted(((v.strip(), f) for v, f in pairs if v and v.strip()),
+                               key=lambda vf: -len(vf[0])):
+        out = re.sub(rf"(?<!\w){re.escape(value)}(?!\w)", field, out, flags=re.IGNORECASE)
+    return out
 
 
 def body_to_html(body: str) -> str:
@@ -1164,6 +1244,7 @@ async def generate_drafts(
     if not queued:
         return 0
     sender_name, sender_org = await _sender_identity(db, campaign)
+    template = await campaign_template(db, campaign)
     drafted = 0
     for p in queued:
         contact = await db.get(Contact, p.contact_id) if p.contact_id else None
@@ -1171,18 +1252,24 @@ async def generate_drafts(
         if contact is None or not contact.email:
             p.status, p.skip_reason = "skipped", "Contact no longer has an email address"
             continue
-        try:
-            draft = await org_gemini.generate_json(
-                db, campaign.org_id, system=DRAFT_SYSTEM,
-                prompt=draft_prompt(campaign, contact, company, sender_name, sender_org),
-                schema=DraftEmail, max_tokens=2048, temperature=0.6,
-            )
-        except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
-            msg = str(exc) or "No AI key is saved in Settings → API Keys"
-            await log_error(db, campaign, f"Drafting stopped: {msg}", now)
-            break
-        subject = " ".join(draft.subject.split())[:150]
-        body = draft.body.strip()[:4000]
+        if template is not None and campaign.template_mode == "template":
+            # The operator's own wording: filled in, not rewritten. No AI call.
+            subject, body = render_template_draft(template, contact, company)
+            subject, body = " ".join(subject.split())[:150], body[:4000]
+        else:
+            try:
+                draft = await org_gemini.generate_json(
+                    db, campaign.org_id, system=DRAFT_SYSTEM,
+                    prompt=draft_prompt(campaign, contact, company, sender_name, sender_org,
+                                        template=template),
+                    schema=DraftEmail, max_tokens=2048, temperature=0.6,
+                )
+            except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
+                msg = str(exc) or "No AI key is saved in Settings → API Keys"
+                await log_error(db, campaign, f"Drafting stopped: {msg}", now)
+                break
+            subject = " ".join(draft.subject.split())[:150]
+            body = draft.body.strip()[:4000]
         if not subject or not body:
             await log_error(db, campaign, f"Empty draft for {p.to_email}; will retry", now)
             continue
@@ -1485,25 +1572,66 @@ def _is_transient_hold(result: dict) -> bool:
 
 
 async def _attachments(db: AsyncSession, campaign: Campaign) -> list:
-    if not campaign.attach_documents:
-        return []
-    from app.services.template_attachments import OutgoingAttachment
+    """Everything a campaign email carries: its documents and its template's files.
 
-    ids = [uuid.UUID(str(i)) for i in campaign.document_ids or []]
-    docs = (
-        await db.execute(
-            select(DiscoveryDocument)
-            .options(undefer(DiscoveryDocument.content))
-            .where(
-                DiscoveryDocument.id.in_(ids),
-                DiscoveryDocument.file_type.in_(list(ATTACHABLE_TYPES)),
+    Documents only when ``attach_documents`` is on (the default for a campaign
+    created from a PDF or DOCX). A template's attachments travel with it in
+    every mode — they are part of what the operator wrote. Deduplicated by
+    filename, documents first.
+    """
+    from app.services.template_attachments import OutgoingAttachment, load_for_send
+
+    out: list = []
+    if campaign.attach_documents:
+        ids = [uuid.UUID(str(i)) for i in campaign.document_ids or []]
+        docs = (
+            await db.execute(
+                select(DiscoveryDocument)
+                .options(undefer(DiscoveryDocument.content))
+                .where(
+                    DiscoveryDocument.id.in_(ids),
+                    DiscoveryDocument.file_type.in_(list(ATTACHABLE_TYPES)),
+                )
+                .order_by(DiscoveryDocument.created_at, DiscoveryDocument.id)
             )
-        )
-    ).scalars().all()
-    return [
-        OutgoingAttachment(filename=d.filename, content_type=ATTACHABLE_TYPES[d.file_type], data=d.content)
-        for d in docs if d.content
-    ]
+        ).scalars().all()
+        for d in docs:
+            if d.content:
+                out.append(OutgoingAttachment(
+                    filename=d.filename, content_type=ATTACHABLE_TYPES[d.file_type], data=d.content))
+            else:
+                logger.warning("Campaign %s: document %s has no stored file to attach", campaign.id, d.id)
+    if campaign.template_id is not None and campaign.template_mode != "ai":
+        out.extend(await load_for_send(db, campaign.template_id))
+    seen: set[str] = set()
+    return [a for a in out if not (a.filename in seen or seen.add(a.filename))]
+
+
+async def attachment_names(db: AsyncSession, campaign: Campaign) -> list[str]:
+    """Filenames :func:`_attachments` would send, without loading the bytes."""
+    from app.models.email_template import EmailTemplateAttachment
+
+    names: list[str] = []
+    if campaign.attach_documents:
+        ids = [uuid.UUID(str(i)) for i in campaign.document_ids or []]
+        names += (
+            await db.execute(
+                select(DiscoveryDocument.filename).where(
+                    DiscoveryDocument.id.in_(ids),
+                    DiscoveryDocument.file_type.in_(list(ATTACHABLE_TYPES)),
+                    DiscoveryDocument.content_purged_at.is_(None),
+                ).order_by(DiscoveryDocument.created_at, DiscoveryDocument.id)
+            )
+        ).scalars().all()
+    if campaign.template_id is not None and campaign.template_mode != "ai":
+        names += (
+            await db.execute(
+                select(EmailTemplateAttachment.filename)
+                .where(EmailTemplateAttachment.template_id == campaign.template_id)
+                .order_by(EmailTemplateAttachment.created_at, EmailTemplateAttachment.id)
+            )
+        ).scalars().all()
+    return list(dict.fromkeys(names))
 
 
 @dataclass

@@ -62,6 +62,9 @@ class _Settings(BaseModel):
     # Legacy name; ``sender_account_id`` takes a Gmail *or* SMTP account id.
     gmail_account_id: Optional[uuid.UUID] = None
     sender_account_id: Optional[uuid.UUID] = None
+    # Draft from an email template; template_id null clears it (see TEMPLATE_MODES).
+    template_id: Optional[uuid.UUID] = None
+    template_mode: Optional[Literal["ai", "template", "ai_template"]] = None
 
     @field_validator("send_window_start", "send_window_end")
     @classmethod
@@ -106,6 +109,8 @@ class CampaignOut(BaseModel):
     icp_json: Optional[dict[str, Any]] = None
     gmail_account_id: Optional[uuid.UUID] = None
     smtp_account_id: Optional[uuid.UUID] = None
+    template_id: Optional[uuid.UUID] = None
+    template_mode: str = "ai"
     daily_send_limit: int
     send_window_start: str
     send_window_end: str
@@ -123,6 +128,8 @@ class CampaignOut(BaseModel):
 class CampaignDetail(CampaignOut):
     metrics: dict[str, Any]
     daily: list[dict[str, Any]]
+    # Filenames every email of this campaign carries (documents + template files).
+    attachments: list[str] = []
 
 
 class ProspectOut(BaseModel):
@@ -255,6 +262,8 @@ def _out(c: Campaign) -> dict:
         "icp_json": c.icp_json,
         "gmail_account_id": c.gmail_account_id,
         "smtp_account_id": c.smtp_account_id,
+        "template_id": c.template_id,
+        "template_mode": c.template_mode or "ai",
         "daily_send_limit": c.daily_send_limit,
         "send_window_start": c.send_window_start,
         "send_window_end": c.send_window_end,
@@ -342,6 +351,24 @@ async def _resolve_sender(db: AsyncSession, user: User, account_id: Optional[uui
         {"code": "gmail_required",
          "message": "Connect a Gmail or SMTP account with sending turned on before starting a campaign."},
     )
+
+
+async def _apply_template(db: AsyncSession, c: Campaign, data: dict) -> None:
+    """Apply ``template_id`` / ``template_mode`` from a create or update payload."""
+    from app.models.email_template import EmailTemplate
+
+    if "template_id" in data:
+        tid = data["template_id"]
+        if tid is not None:
+            t = await db.get(EmailTemplate, tid)  # org-scoped: another tenant's id isn't found
+            if t is None or t.is_archived:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "That email template wasn't found.")
+        c.template_id = tid
+    if data.get("template_mode"):
+        c.template_mode = data["template_mode"]
+    if c.template_mode != "ai" and c.template_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Choose an email template, or let the AI write the drafts.")
 
 
 def _set_sender(c: Campaign, kind: str, acct) -> None:
@@ -493,9 +520,16 @@ async def create_campaign(
         review_before_send=True,
         attach_documents=False,
     )
+    # Attach the campaign's documents by default when there is something to
+    # attach: the brief the operator uploaded is usually the thing they want
+    # the prospect to read.
+    c.attach_documents = any(d.file_type in svc.ATTACHABLE_TYPES for d in docs)
+    c.template_mode = "ai"
     _set_sender(c, sender_kind, account)
     _apply_settings(c, payload.model_dump(
         exclude={"name", "document_ids", "gmail_account_id", "sender_account_id"}))
+    await _apply_template(db, c, payload.model_dump(
+        include={"template_id", "template_mode"}, exclude_unset=True))
     db.add(c)
     await db.commit()
     await db.refresh(c)
@@ -573,7 +607,8 @@ async def get_campaign(
         }
         for log in logs
     ]
-    return {**_out(c), "metrics": await _metrics(db, c), "daily": daily}
+    return {**_out(c), "metrics": await _metrics(db, c), "daily": daily,
+            "attachments": await svc.attachment_names(db, c)}
 
 
 @router.patch("/{campaign_id}", response_model=CampaignOut)
@@ -592,6 +627,7 @@ async def update_campaign(
         c.name = data["name"].strip()
     if "icp_json" in data and data["icp_json"] is not None:
         c.icp_json = svc.Icp.model_validate(data["icp_json"]).model_dump()
+    await _apply_template(db, c, {k: data[k] for k in ("template_id", "template_mode") if k in data})
     if data.get("sender_account_id") or data.get("gmail_account_id"):
         _set_sender(c, *await _resolve_sender(
             db, user, data.get("sender_account_id") or data["gmail_account_id"]))
@@ -849,3 +885,63 @@ async def add_manual_prospect(
     await db.commit()
     processing = _dispatch_processing(c) if added["queued"] else "nothing_queued"
     return AddProspectsOut(**added, processing=processing)
+
+
+
+class SaveTemplateIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    # Also draft the rest of this campaign from it: "template" fills it in as
+    # written, "ai_template" has the AI personalise it per prospect.
+    use_for_campaign: Optional[Literal["template", "ai_template"]] = None
+
+
+class SavedTemplateOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    subject: str
+    body: str
+    campaign_template_mode: str
+
+
+@router.post("/{campaign_id}/prospects/{prospect_id}/save-template", response_model=SavedTemplateOut,
+             status_code=status.HTTP_201_CREATED)
+async def save_draft_as_template(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: SaveTemplateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Save a prospect's draft as a reusable email template.
+
+    The prospect's name, company and title become merge fields, so the
+    template reads right for the next person. It lands in Email Templates like
+    any other, editable there, and can become this campaign's template at once.
+    """
+    from app.models.email_template import EmailTemplate
+
+    c = await _get_campaign(db, campaign_id, user)
+    p = await _get_prospect(db, c, prospect_id)
+    if not p.email_subject or not p.email_body:
+        raise HTTPException(status.HTTP_409_CONFLICT, "There is no draft to save yet.")
+    name = " ".join(payload.name.split())
+    clash = (await db.execute(
+        select(EmailTemplate.id).where(func.lower(EmailTemplate.name) == name.lower()).limit(1)
+    )).first()
+    if clash is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"A template called \"{name}\" already exists.")
+    contact = await db.get(Contact, p.contact_id) if p.contact_id else None
+    company = await db.get(Company, p.company_id) if p.company_id else None
+    t = EmailTemplate(
+        name=name,
+        subject=svc.generalize_draft(p.email_subject, contact, company)[:500],
+        body=svc.body_to_html(svc.generalize_draft(p.email_body, contact, company)),
+    )
+    db.add(t)
+    await db.flush()
+    if payload.use_for_campaign:
+        c.template_id, c.template_mode = t.id, payload.use_for_campaign
+    await db.commit()
+    await db.refresh(t)
+    return SavedTemplateOut(id=t.id, name=t.name, subject=t.subject, body=t.body,
+                            campaign_template_mode=c.template_mode)

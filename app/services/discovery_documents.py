@@ -221,9 +221,28 @@ async def import_candidates(
 
 
 async def purge_expired_files(db: AsyncSession, *, now: Optional[datetime] = None) -> int:
-    """Null out file bytes older than the retention window; keep the results."""
+    """Null out file bytes older than the retention window; keep the results.
+
+    Except a document a live campaign attaches to its emails: purging it would
+    quietly send the rest of that campaign without the brief the operator chose
+    to attach. It becomes purgeable once no such campaign holds it (stopped,
+    deleted, or attaching switched off).
+    """
+    from app.models.campaign import Campaign
+
     now = now or datetime.now(timezone.utc)
     cutoff = now - FILE_RETENTION
+    attached: set[str] = set()
+    for ids in (
+        await db.execute(
+            select(Campaign.document_ids).where(
+                Campaign.deleted_at.is_(None),
+                Campaign.status != "stopped",
+                Campaign.attach_documents.is_(True),
+            )
+        )
+    ).scalars().all():
+        attached |= {str(i) for i in ids or []}
     docs = (
         await db.execute(
             select(DiscoveryDocument).where(
@@ -232,6 +251,7 @@ async def purge_expired_files(db: AsyncSession, *, now: Optional[datetime] = Non
             )
         )
     ).scalars().all()
+    docs = [d for d in docs if str(d.id) not in attached]
     for doc in docs:
         doc.content = None
         doc.content_purged_at = now

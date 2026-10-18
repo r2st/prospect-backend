@@ -83,6 +83,13 @@ class Campaign(Base, OrgScopedMixin):
     smtp_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("smtp_accounts.id", ondelete="SET NULL")
     )
+    # Drafting from an email template (migration 126): "ai" | "template" | "ai_template".
+    template_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("email_templates.id", ondelete="SET NULL")
+    )
+    template_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ai", server_default="ai"
+    )
     daily_send_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
     send_window_start: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     send_window_end: Mapped[str] = mapped_column(String(5), nullable=False, default="18:00")
