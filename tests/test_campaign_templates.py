@@ -443,3 +443,69 @@ async def test_a_draft_saved_as_a_template_is_linked_to_it(client, db_session):
     assert str(p.template_id) == r.json()["id"]
     listed = (await client.get("/api/v1/email-templates")).json()
     assert any(t["id"] == r.json()["id"] and "{{first_name}}" in t["body"] for t in listed)
+
+
+# ── the campaign's default template ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_new_campaign_drafts_from_the_orgs_default_template(client, db_session, monkeypatch):
+    t = await _template(db_session)
+    t.is_default = True
+    await db_session.commit()
+    r = await _create(client, db_session, monkeypatch, [await _doc(db_session)])
+    assert r.status_code == 201, r.text
+    assert r.json()["template_id"] == str(t.id)
+    assert r.json()["template_mode"] == "ai_template"
+
+
+@pytest.mark.asyncio
+async def test_a_template_chosen_at_creation_beats_the_default(client, db_session, monkeypatch):
+    default = await _template(db_session, name="Default")
+    default.is_default = True
+    chosen = await _template(db_session, name="Chosen")
+    await db_session.commit()
+    r = await _create(client, db_session, monkeypatch, [await _doc(db_session)],
+                      template_id=str(chosen.id), template_mode="template")
+    assert (r.json()["template_id"], r.json()["template_mode"]) == (str(chosen.id), "template")
+    # Choosing "the AI writes them" at creation is honoured too.
+    r = await _create(client, db_session, monkeypatch, [await _doc(db_session)],
+                      template_id=None, template_mode="ai")
+    assert (r.json()["template_id"], r.json()["template_mode"]) == (None, "ai")
+
+
+@pytest.mark.asyncio
+async def test_without_a_default_template_a_new_campaign_is_ai_written(client, db_session, monkeypatch):
+    r = await _create(client, db_session, monkeypatch, [await _doc(db_session)])
+    assert (r.json()["template_id"], r.json()["template_mode"]) == (None, "ai")
+
+
+@pytest.mark.asyncio
+async def test_an_archived_default_template_is_not_used(client, db_session, monkeypatch):
+    t = await _template(db_session)
+    t.is_default, t.is_archived = True, True
+    await db_session.commit()
+    r = await _create(client, db_session, monkeypatch, [await _doc(db_session)])
+    assert r.json()["template_id"] is None and r.json()["template_mode"] == "ai"
+
+
+@pytest.mark.asyncio
+async def test_picking_a_template_alone_switches_drafting_to_it(client, db_session, monkeypatch):
+    t = await _template(db_session)
+    c = await _campaign(db_session)
+    url = f"/api/v1/campaigns/{c.id}"
+    r = await client.patch(url, json={"template_id": str(t.id)})
+    assert (r.json()["template_id"], r.json()["template_mode"]) == (str(t.id), "ai_template")
+    # A mode already chosen is kept when only the template changes.
+    await client.patch(url, json={"template_mode": "template"})
+    other = await _template(db_session, name="Other")
+    r = await client.patch(url, json={"template_id": str(other.id)})
+    assert r.json()["template_mode"] == "template"
+    # Clearing the template hands drafting back to the AI rather than a 422.
+    r = await client.patch(url, json={"template_id": None})
+    assert r.status_code == 200
+    assert (r.json()["template_id"], r.json()["template_mode"]) == (None, "ai")
+
+    # New drafts follow the campaign's template.
+    await client.patch(url, json={"template_id": str(t.id), "template_mode": "template"})
+    await db_session.refresh(c)
+    assert (await svc.campaign_template(db_session, c)).id == t.id

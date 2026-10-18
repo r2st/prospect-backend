@@ -374,6 +374,16 @@ async def _resolve_sender(db: AsyncSession, user: User, account_id: Optional[uui
     )
 
 
+async def _default_template(db: AsyncSession):
+    """The org's default email template (org-scoped read), unless archived."""
+    from app.models.email_template import EmailTemplate
+
+    t = (await db.execute(
+        select(EmailTemplate).where(EmailTemplate.is_default == True)  # noqa: E712
+    )).scalars().first()
+    return None if t is None or t.is_archived else t
+
+
 async def _apply_template(db: AsyncSession, c: Campaign, data: dict) -> None:
     """Apply ``template_id`` / ``template_mode`` from a create or update payload."""
     from app.models.email_template import EmailTemplate
@@ -385,6 +395,12 @@ async def _apply_template(db: AsyncSession, c: Campaign, data: dict) -> None:
             if t is None or t.is_archived:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "That email template wasn't found.")
         c.template_id = tid
+        if not data.get("template_mode"):
+            # Picking a template means drafting from it; clearing it means the AI.
+            if tid is None:
+                c.template_mode = "ai"
+            elif c.template_mode == "ai":
+                c.template_mode = "ai_template"
     if data.get("template_mode"):
         c.template_mode = data["template_mode"]
     if c.template_mode != "ai" and c.template_id is None:
@@ -549,8 +565,14 @@ async def create_campaign(
     _set_sender(c, sender_kind, account)
     _apply_settings(c, payload.model_dump(
         exclude={"name", "document_ids", "gmail_account_id", "sender_account_id"}))
-    await _apply_template(db, c, payload.model_dump(
-        include={"template_id", "template_mode"}, exclude_unset=True))
+    template_choice = payload.model_dump(include={"template_id", "template_mode"}, exclude_unset=True)
+    if "template_id" not in template_choice:
+        # No choice made: the org's default template, so the first drafts —
+        # written the moment the campaign exists — already use it.
+        default = await _default_template(db)
+        if default is not None:
+            template_choice = {"template_id": default.id, "template_mode": "ai_template"}
+    await _apply_template(db, c, template_choice)
     db.add(c)
     await db.commit()
     await db.refresh(c)
