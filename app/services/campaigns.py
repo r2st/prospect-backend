@@ -76,7 +76,9 @@ from app.services import org_gemini, suppression
 logger = logging.getLogger(__name__)
 
 TICK = timedelta(minutes=15)
-GAP_SECONDS = (120, 300)
+# Approved emails go out as soon as they're approved; this only spaces a burst
+# of approvals so a mailbox doesn't fire them all in the same second.
+GAP_SECONDS = (20, 60)
 WARMUP_STEP = 5
 MAX_DAILY_LIMIT = 100
 BOUNCE_PAUSE_RATE = 0.05
@@ -171,6 +173,15 @@ def next_window_open(campaign: Campaign, now: Optional[datetime] = None) -> Opti
         if start > now:
             return start
     return None
+
+
+def send_cap(campaign: Campaign) -> int:
+    """How many approved emails may go out today: the campaign's daily limit.
+
+    An approval is the operator's say-so to send, so it isn't held for the
+    send window or the warm-up ramp — only the ceiling the operator set.
+    """
+    return max(0, campaign.daily_send_limit)
 
 
 def ramp_cap(campaign: Campaign) -> int:
@@ -1668,10 +1679,6 @@ async def schedule_sends(
 ) -> int:
     """Hand this tick's sends to ``schedule(org_id, prospect_id, countdown_seconds)``."""
     now = _aware(now)
-    is_open = window_open(campaign, now)
-    if not is_open:
-        logger.info("schedule_sends campaign=%s: window closed at %s", campaign.id, now)
-        return 0
     acct = await sending_account(db, campaign)
     if acct is None:
         logger.info("schedule_sends campaign=%s: no sending account (gmail=%s smtp=%s)",
@@ -1695,10 +1702,10 @@ async def schedule_sends(
             )
         )
     ).scalar_one()
-    cap, already_sent = ramp_cap(campaign), await sent_today(db, campaign, now)
+    cap, already_sent = send_cap(campaign), await sent_today(db, campaign, now)
     quota = cap - already_sent - in_flight
     if quota <= 0:
-        logger.info("schedule_sends campaign=%s: no quota (ramp_cap=%d sent_today=%d in_flight=%d)",
+        logger.info("schedule_sends campaign=%s: no quota (send_cap=%d sent_today=%d in_flight=%d)",
                     campaign.id, cap, already_sent, in_flight)
         return 0
     # Only verified addresses are sent; an unverified one waits for
@@ -1729,14 +1736,13 @@ async def schedule_sends(
             .limit(quota)
         )
     ).scalars().all()
-    _, window_end = window_bounds(campaign, now)
-    horizon = min(now + TICK, window_end)
+    horizon = now + TICK
     at = max(now, _aware(campaign.next_send_at) if campaign.next_send_at else now)
     logger.info(
-        "schedule_sends campaign=%s: window=%s, account=%s, quota=%d, ready=%d, "
-        "unverified_held=%d, now=%s, next_send_at=%s, at=%s, horizon=%s, window_end=%s",
-        campaign.id, is_open, acct is not None, quota, len(ready), unverified,
-        now, campaign.next_send_at, at, horizon, window_end,
+        "schedule_sends campaign=%s: account=%s, quota=%d, ready=%d, "
+        "unverified_held=%d, now=%s, next_send_at=%s, at=%s, horizon=%s",
+        campaign.id, acct is not None, quota, len(ready), unverified,
+        now, campaign.next_send_at, at, horizon,
     )
     scheduled = 0
     for p in ready:
@@ -1852,10 +1858,10 @@ async def send_prospect(
         p.scheduled_for = None
         await db.commit()
         return SendOutcome("campaign_inactive")
-    if not window_open(campaign, now) or await sent_today(db, campaign, now) >= ramp_cap(campaign):
+    if await sent_today(db, campaign, now) >= send_cap(campaign):
         p.scheduled_for = None
         await db.commit()
-        return SendOutcome("held", "outside window or campaign cap reached")
+        return SendOutcome("held", "campaign daily limit reached")
     account = await sending_account(db, campaign)
     if account is None:
         p.scheduled_for = None
@@ -2041,14 +2047,14 @@ async def send_approved_now(
     otherwise be held) and ``schedule_sends``. No discovery and no drafting —
     those spend AI and Hunter budget and belong to the beat.
 
-    Every gate still applies, because it is the same ``schedule_sends``: the
-    window, the warm-up cap, verified-only, and the 120–300s gap between sends
-    (``next_send_at``). So the first approval goes out now and a burst of
-    approvals is paced, not blasted. The ``scheduled_for`` lease keeps this and
-    a concurrent tick from scheduling the same row twice, and the claim in
-    ``send_prospect`` makes a duplicate task harmless anyway. Whatever this
-    can't schedule — window shut, cap spent, past the horizon — the tick still
-    picks up.
+    Same ``schedule_sends`` as the tick, at any hour: no send window and no
+    warm-up ramp — only the campaign's daily limit, verified-only, and the
+    20–60s gap between sends (``next_send_at``). So the first approval goes out
+    now and a burst of approvals follows within a minute or two. The
+    ``scheduled_for`` lease keeps this and a concurrent tick from scheduling
+    the same row twice, and the claim in ``send_prospect`` makes a duplicate
+    task harmless anyway. Whatever this can't schedule — limit spent, past the
+    horizon — the tick still picks up.
     """
     now = _aware(now)
     campaign = await db.get(Campaign, campaign_id)

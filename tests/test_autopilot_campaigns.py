@@ -144,7 +144,8 @@ async def test_create_campaign_builds_icp_and_picks_the_callers_mailbox(client, 
     assert dispatched == [(str(APPREND_ORG_ID), body["id"])]
     assert body["icp_json"]["target_industries"] == ["Manufacturing"]
     assert body["gmail_account_id"] == str(acct.id)
-    assert body["todays_cap"] == 5 and body["status"] == "active"
+    # Approved emails aren't held to the warm-up ramp: today's cap is the limit.
+    assert body["todays_cap"] == 40 and body["status"] == "active"
 
     listed = await client.get("/api/v1/campaigns")
     assert [c["id"] for c in listed.json()] == [body["id"]]
@@ -231,7 +232,7 @@ async def test_an_address_is_never_queued_twice_across_campaigns(db_session):
 # ── sending ──────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_schedule_spaces_sends_two_to_five_minutes_and_respects_the_ramp(db_session):
+async def test_schedule_sends_every_approval_now_spaced_20_to_60_seconds(db_session):
     c = await _campaign(db_session)
     for i in range(8):
         ct = await _contact(db_session, f"p{i}@acme{i}.com", verified=True)
@@ -243,11 +244,22 @@ async def test_schedule_spaces_sends_two_to_five_minutes_and_respects_the_ramp(d
     calls = []
     n = await svc.schedule_sends(db_session, c, MIDWEEK,
                                  schedule=lambda org, pid, cd: calls.append(cd))
-    # 15-minute tick, 120–300s gaps → at most 8 fit, ramp day 1 caps at 5.
-    assert 1 <= n <= 5 and len(calls) == n
+    # Warm-up day 1 used to cap this at 5; an approval now goes regardless,
+    # and 8 sends 20–60s apart all fit in the tick.
+    assert n == 8 and len(calls) == 8
     assert calls[0] == 0
     gaps = [b - a for a, b in zip(calls, calls[1:])]
-    assert all(120 <= g <= 300 for g in gaps)
+    assert all(20 <= g <= 60 for g in gaps)
+
+
+@pytest.mark.asyncio
+async def test_schedule_stops_at_the_campaigns_daily_limit(db_session):
+    c = await _campaign(db_session, daily_send_limit=3)
+    for i in range(5):
+        await _approved(db_session, c, f"cap{i}@acme{i}.com")
+    calls = []
+    n = await svc.schedule_sends(db_session, c, MIDWEEK, schedule=lambda *a: calls.append(a))
+    assert n == 3 and len(calls) == 3
 
 
 @pytest.mark.asyncio
@@ -907,13 +919,17 @@ async def test_instant_send_neither_discovers_nor_drafts(db_session, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_instant_send_respects_the_window_and_campaign_status(db_session):
+async def test_instant_send_ignores_the_window_but_respects_campaign_status(db_session):
     c = await _campaign(db_session)
     await _approved(db_session, c, "later@acme.com")
     calls = []
-    out = await svc.send_approved_now(db_session, c.id, now=SATURDAY, schedule=lambda *a: calls.append(a))
-    assert out["scheduled"] == 0 and calls == []  # weekend, weekends off
+    # Saturday 03:00 in Toronto, weekends off: outside every window, sent anyway.
+    night = datetime(2026, 10, 17, 7, 0, tzinfo=timezone.utc)
+    out = await svc.send_approved_now(db_session, c.id, now=night, schedule=lambda *a: calls.append(a))
+    assert out["scheduled"] == 1 and calls[0][2] == 0
 
+    calls.clear()
+    await _approved(db_session, c, "paused@pausedco.com")
     c.status = "paused"
     await db_session.commit()
     out = await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
@@ -941,7 +957,7 @@ async def test_approving_dispatches_the_send_instead_of_waiting_for_the_tick(cli
 
 
 @pytest.mark.asyncio
-async def test_approving_outside_the_window_says_so_and_dispatches_nothing(client, db_session, monkeypatch):
+async def test_approving_outside_the_window_still_dispatches_the_send(client, db_session, monkeypatch):
     from app.tasks import campaigns as campaign_tasks
 
     c = await _campaign(db_session, review_before_send=True)
@@ -954,8 +970,8 @@ async def test_approving_outside_the_window_says_so_and_dispatches_nothing(clien
     monkeypatch.setattr(svc, "window_open", lambda campaign, now=None: False)
 
     r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/approve")
-    assert r.json()["instant_send"] == "window_closed"
-    assert dispatched == []
+    assert r.json()["instant_send"] == "dispatched"
+    assert dispatched == [(str(c.org_id), str(c.id))]
 
 
 @pytest.mark.asyncio
@@ -1400,11 +1416,29 @@ async def test_discover_now_searches_then_processes(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_campaign_says_when_its_window_opens(client, db_session):
+async def test_the_campaign_never_reports_sending_as_waiting_on_a_window(client, db_session):
     c = await _campaign(db_session)
     body = (await client.get(f"/api/v1/campaigns/{c.id}")).json()
-    assert isinstance(body["window_open"], bool)
-    assert body["send_window_opens_at"] is not None
+    assert body["window_open"] is True
+    assert body["send_window_opens_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_prospect_sends_outside_the_window(db_session, monkeypatch):
+    from app.services import email_dispatch
+
+    c = await _campaign(db_session)
+    p = await _approved(db_session, c, "now@acme.com")
+    sent = []
+
+    async def fake_send(*a, **kw):
+        sent.append(kw.get("to_email") or (a[1] if len(a) > 1 else None))
+        return {"status": "sent", "message_id": "m1", "thread_id": "t1"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    night = datetime(2026, 10, 17, 7, 0, tzinfo=timezone.utc)
+    out = await svc.send_prospect(db_session, p.id, night)
+    assert out.status != "held", out
 
 
 @pytest.mark.asyncio

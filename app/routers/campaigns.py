@@ -254,11 +254,9 @@ def _dispatch_instant_send(c: Campaign) -> str:
     """Schedule the campaign's approved emails now instead of at the next tick.
 
     Best-effort, after the commit that made the prospect approved: if the
-    broker is unreachable the 15-minute beat sends it as before. Not dispatched
-    while the window is shut — the task would only find nothing to do.
+    broker is unreachable the 15-minute beat sends it as before. Dispatched at
+    any hour: approved emails aren't held for a send window.
     """
-    if not svc.window_open(c):
-        return "window_closed"
     try:
         from app.tasks.campaigns import send_approved_now
 
@@ -291,10 +289,12 @@ def _out(c: Campaign) -> dict:
         "review_before_send": c.review_before_send,
         "attach_documents": c.attach_documents,
         "warmup_day": c.warmup_day,
-        "todays_cap": svc.ramp_cap(c),
+        "todays_cap": svc.send_cap(c),
         "last_discovery_on": c.last_discovery_on.isoformat() if c.last_discovery_on else None,
-        "window_open": svc.window_open(c),
-        "send_window_opens_at": svc.next_window_open(c),
+        # Approved emails send at any hour, so sending is never waiting on a
+        # window. Kept in the payload for clients that still read them.
+        "window_open": True,
+        "send_window_opens_at": None,
         "created_at": c.created_at,
         "updated_at": c.updated_at,
     }
@@ -471,7 +471,7 @@ async def _metrics(db: AsyncSession, c: Campaign) -> dict:
         "reply_rate": round(replied / mailed, 4) if mailed else 0.0,
         "bounce_rate": round(bounced / mailed, 4) if mailed else 0.0,
         "sent_today": await svc.sent_today(db, c),
-        "todays_cap": svc.ramp_cap(c),
+        "todays_cap": svc.send_cap(c),
         "awaiting_review": by_status.get("draft_created", 0),
         "companies_discovered": companies_discovered,
         "companies_without_email": by_status.get("no_email", 0),
