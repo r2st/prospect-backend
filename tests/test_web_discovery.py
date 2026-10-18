@@ -377,3 +377,33 @@ async def test_known_names_are_filtered_even_without_a_domain(db_session, monkey
 def test_company_match_key(a, b, same):
     assert (gemini_discovery.company_match_key(a) == gemini_discovery.company_match_key(b)) is same
     assert gemini_discovery.company_match_key(a)
+
+
+# ── Claude refuses `temperature` ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider, sends_temperature", [("anthropic", False), ("groq", True)])
+async def test_claude_requests_carry_no_temperature(monkeypatch, provider, sends_temperature):
+    """Anthropic's current models 400 any request with `temperature` — found live:
+    every call failed over to Groq, so a saved Claude key was never used."""
+    from app.services import llm_providers
+
+    bodies = []
+    real = httpx.AsyncClient
+
+    def handler(req):
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+    class _Client(real):
+        def __init__(self, *a, **kw):
+            kw["transport"] = httpx.MockTransport(handler)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(llm_providers.httpx, "AsyncClient", _Client)
+    spec = org_gemini._BUILDERS[provider](ORG, "k")
+    await llm_providers.chat_completion(
+        [{"role": "user", "content": "x"}], providers=[spec], max_tokens=10,
+        temperature=0.2, timeout=5, breaker=llm_providers.CircuitBreaker(threshold=3, cooldown_seconds=1),
+    )
+    assert ("temperature" in bodies[0]) is sends_temperature

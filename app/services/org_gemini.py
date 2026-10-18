@@ -198,6 +198,7 @@ def anthropic_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
     so it shares chat_completion's retry, sibling-model fallback and breaker.
     No response_format: the compatibility layer doesn't honour JSON mode, and
     every Discovery prompt asks for JSON; _json_object_text tolerates prose.
+    No temperature either: the current models refuse the parameter outright.
     """
     settings = get_settings()
     return ProviderSpec(
@@ -206,6 +207,8 @@ def anthropic_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
         api_key=api_key,
         models=_models(settings.discovery_anthropic_models, "claude-haiku-5-5"),
         supports_vision=True,
+        # Current Claude models reject `temperature` with a 400 (llm_providers).
+        supports_temperature=False,
     )
 
 

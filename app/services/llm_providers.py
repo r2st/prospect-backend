@@ -136,6 +136,10 @@ class ProviderSpec:
     headers: Mapping[str, str] = field(default_factory=dict)
     extra_body: Mapping[str, Any] = field(default_factory=dict)
     supports_vision: bool = False
+    # Anthropic's current models answer 400 "`temperature` is deprecated for this
+    # model" to any request carrying one — so every call failed over to the next
+    # provider and a saved Claude key was never actually used.
+    supports_temperature: bool = True
 
     @property
     def endpoint(self) -> str:
@@ -572,7 +576,7 @@ async def chat_completion(
                     "messages": openai_messages,
                 }
                 payload.update(spec.extra_body)
-                if temperature is not None:
+                if temperature is not None and spec.supports_temperature:
                     payload["temperature"] = temperature
 
                 headers = {
