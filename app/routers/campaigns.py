@@ -121,6 +121,10 @@ class CampaignOut(BaseModel):
     warmup_day: int
     todays_cap: int
     last_discovery_on: Optional[str] = None
+    # Whether emails can go out right now, and when the window next opens (UTC):
+    # an approved email on a Sunday waits for Monday morning, and says so.
+    window_open: bool = False
+    send_window_opens_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -238,6 +242,9 @@ def _dispatch_processing(c: Campaign) -> str:
     return "dispatched"
 
 
+_WINDOW_FIELDS = {"send_window_start", "send_window_end", "send_on_weekends", "timezone"}
+
+
 def _require_open(c: Campaign) -> None:
     if c.status == "stopped" or c.deleted_at is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This campaign is stopped; create a new one.")
@@ -286,6 +293,8 @@ def _out(c: Campaign) -> dict:
         "warmup_day": c.warmup_day,
         "todays_cap": svc.ramp_cap(c),
         "last_discovery_on": c.last_discovery_on.isoformat() if c.last_discovery_on else None,
+        "window_open": svc.window_open(c),
+        "send_window_opens_at": svc.next_window_open(c),
         "created_at": c.created_at,
         "updated_at": c.updated_at,
     }
@@ -683,8 +692,9 @@ async def update_campaign(
         c.status = new_status
     await db.commit()
     await db.refresh(c)
-    if new_status == "active":
-        # Resuming: whatever was approved while paused goes out now.
+    if new_status == "active" or (c.status == "active" and _WINDOW_FIELDS & data.keys()):
+        # Resuming, or the window just moved (weekends turned on, say):
+        # whatever is approved and now inside it goes out now.
         _dispatch_instant_send(c)
     return _out(c)
 
@@ -1038,6 +1048,37 @@ async def redraft_campaign(
     count = await svc.redraft(db, c)
     await db.commit()
     return {"redrafting": count, "processing": _dispatch_processing(c) if count else "nothing_queued"}
+
+
+@router.post("/{campaign_id}/discover")
+async def discover_more(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Search for more companies now instead of waiting for the next day.
+
+    Runs in the worker (a search takes a minute); capped per day because each
+    one spends AI and Hunter quota.
+    """
+    c = await _get_campaign(db, campaign_id, user)
+    _require_open(c)
+    if c.status != "active":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Resume the campaign to search for more prospects.")
+    done = await svc.searches_today(db, c)
+    await db.commit()
+    if done >= svc.MANUAL_DISCOVERY_RUNS:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                            f"Already searched {done} times today — more tomorrow.")
+    try:
+        from app.tasks.campaigns import discover_campaign_now
+
+        discover_campaign_now.delay(str(c.org_id), str(c.id))
+    except Exception as exc:  # pragma: no cover - broker-dependent
+        logger.warning("Could not dispatch discovery for campaign %s: %s", c.id, exc)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Couldn't start the search; try again shortly.")
+    return {"processing": "dispatched", "searches_today": done,
+            "searches_left": svc.MANUAL_DISCOVERY_RUNS - done - 1}
 
 
 class ProspectRedraftIn(BaseModel):

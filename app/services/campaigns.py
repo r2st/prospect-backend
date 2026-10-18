@@ -156,6 +156,23 @@ def window_open(campaign: Campaign, now: Optional[datetime] = None) -> bool:
     return start <= now < end
 
 
+def next_window_open(campaign: Campaign, now: Optional[datetime] = None) -> Optional[datetime]:
+    """When sending can next happen, in UTC: ``now`` if the window is open."""
+    now = _aware(now)
+    if window_open(campaign, now):
+        return now
+    tz = tz_of(campaign)
+    today = now.astimezone(tz).date()
+    for offset in range(8):
+        day = today + timedelta(days=offset)
+        if not campaign.send_on_weekends and day.weekday() >= 5:
+            continue
+        start = datetime.combine(day, parse_hhmm(campaign.send_window_start), tzinfo=tz).astimezone(timezone.utc)
+        if start > now:
+            return start
+    return None
+
+
 def ramp_cap(campaign: Campaign) -> int:
     """Today's campaign ceiling: 5 on day 1, +5 a day, up to the campaign's limit."""
     return max(0, min(campaign.daily_send_limit, WARMUP_STEP * max(1, campaign.warmup_day)))
@@ -175,7 +192,7 @@ async def daily_log(db: AsyncSession, campaign: Campaign, day: date) -> Campaign
     if row is None:
         row = CampaignDailyLog(
             campaign_id=campaign.id, date=day,
-            prospects_found=0, emails_sent=0, emails_bounced=0, errors=[],
+            prospects_found=0, emails_sent=0, emails_bounced=0, errors=[], discovery_runs=0,
         )
         db.add(row)
         await db.flush()
@@ -1115,7 +1132,51 @@ async def discover_prospects(
     campaign.last_discovery_on = local_today(campaign, now)
     log = await daily_log(db, campaign, local_today(campaign, now))
     log.prospects_found = (log.prospects_found or 0) + total
+    log.discovery_runs = (log.discovery_runs or 0) + 1
+    log.last_discovery_at = _aware(now)
     return total
+
+
+# Searches the tick runs on its own in a day: the first, then top-ups while the
+# campaign has fewer prospects in hand than it can send in a day. A day whose
+# search came back mostly undeliverable or email-less used to sit idle until
+# tomorrow ("it is not searching more contacts").
+AUTO_DISCOVERY_RUNS = 3
+DISCOVERY_TOPUP_GAP = timedelta(hours=2)
+# Including the operator's "Find more prospects" — each search spends AI quota.
+MANUAL_DISCOVERY_RUNS = 6
+
+
+async def discovery_due(db: AsyncSession, campaign: Campaign, now: Optional[datetime] = None) -> bool:
+    """Whether this tick should search for more companies."""
+    now = _aware(now)
+    pending = await _pending_count(db, campaign)
+    if campaign.last_discovery_on != local_today(campaign, now):
+        return pending < 2 * campaign.daily_send_limit
+    if pending >= campaign.daily_send_limit:
+        return False
+    log = await _todays_log(db, campaign, now)
+    if log is None or (log.discovery_runs or 0) >= AUTO_DISCOVERY_RUNS:
+        return False
+    # A day logged before searches were counted ran its search when the log opened.
+    last = log.last_discovery_at or log.created_at
+    return last is None or now - _aware(last) >= DISCOVERY_TOPUP_GAP
+
+
+async def _todays_log(db: AsyncSession, campaign: Campaign, now: Optional[datetime]) -> Optional[CampaignDailyLog]:
+    return (
+        await db.execute(
+            select(CampaignDailyLog).where(
+                CampaignDailyLog.campaign_id == campaign.id,
+                CampaignDailyLog.date == local_today(campaign, now),
+            ).limit(1)
+        )
+    ).scalars().first()
+
+
+async def searches_today(db: AsyncSession, campaign: Campaign, now: Optional[datetime] = None) -> int:
+    log = await _todays_log(db, campaign, now)
+    return (log.discovery_runs or 0) if log is not None else 0
 
 
 async def _pending_count(db: AsyncSession, campaign: Campaign) -> int:
@@ -1927,9 +1988,7 @@ async def run_campaign(
         return {**out, "paused": "bounce_rate"}
     await advance_warmup(db, campaign, now)
 
-    if campaign.last_discovery_on != local_today(campaign, now) and (
-        await _pending_count(db, campaign) < 2 * campaign.daily_send_limit
-    ):
+    if await discovery_due(db, campaign, now):
         try:
             out["discovered"] = await discover_prospects(db, campaign, now)
         except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
@@ -2033,6 +2092,36 @@ async def process_new_prospects(
         return {"campaign_id": str(campaign_id), "error": str(exc)}
     return {"campaign_id": str(campaign_id), "verification": verification,
             "drafted": drafted, "scheduled": scheduled}
+
+
+async def discover_now(
+    db: AsyncSession, campaign_id: uuid.UUID, *, now: Optional[datetime] = None, schedule: ScheduleFn
+) -> dict:
+    """Search for more companies now — the operator's "Find more prospects" —
+    then verify, draft and schedule what it found, like a tick would."""
+    now = _aware(now)
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None or campaign.status != "active" or campaign.deleted_at is not None:
+        return {"campaign_id": str(campaign_id), "skipped": "not_active"}
+    if await searches_today(db, campaign, now) >= MANUAL_DISCOVERY_RUNS:
+        return {"campaign_id": str(campaign_id), "skipped": "daily_limit"}
+    out: dict = {"campaign_id": str(campaign_id)}
+    try:
+        out["discovered"] = await discover_prospects(db, campaign, now)
+    except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
+        await log_error(db, campaign, f"Discovery failed: {exc or 'no AI key saved'}", now)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Campaign %s discovery on demand failed", campaign_id)
+        await db.rollback()
+        return {**out, "error": str(exc)}
+    await db.commit()
+    out["verification"] = await verify_prospects(db, campaign)
+    await db.commit()
+    out["drafted"] = await generate_drafts(db, campaign, now)
+    await db.commit()
+    out["scheduled"] = await schedule_sends(db, campaign, now, schedule=schedule)
+    await db.commit()
+    return out
 
 
 async def run_campaigns_tick(

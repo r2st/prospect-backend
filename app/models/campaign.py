@@ -187,6 +187,10 @@ class CampaignDailyLog(Base, OrgScopedMixin):
     emails_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     emails_bounced: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     errors: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Discovery searches run this day and when the last one ran (migration 128):
+    # a short day is topped up, a few hours apart, instead of waiting for tomorrow.
+    discovery_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_discovery_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

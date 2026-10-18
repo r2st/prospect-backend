@@ -1302,3 +1302,122 @@ async def test_discovery_passes_known_names_and_the_offering(db_session, monkeyp
     await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
     assert "Razorpay" in _run_search.last_names
     assert _run_search.last_offering == "We sell widgets"
+
+
+# ── a short day is topped up; when the window next opens ─────────────────────
+# Day one found 6 companies with an address (Hunter rejected 4) and 6 with
+# none, then sat idle until tomorrow. Two approved emails waited for Monday
+# with nothing on the page saying so.
+
+SUNDAY = datetime(2026, 10, 18, 17, 0, tzinfo=timezone.utc)  # 13:00 in Toronto
+
+
+def test_the_next_window_skips_the_weekend():
+    c = Campaign(timezone="America/Toronto", send_window_start="09:00", send_window_end="18:00",
+                 send_on_weekends=False)
+    assert not svc.window_open(c, SUNDAY)
+    assert svc.next_window_open(c, SUNDAY) == datetime(2026, 10, 19, 13, 0, tzinfo=timezone.utc)
+    c.send_on_weekends = True
+    assert svc.next_window_open(c, SUNDAY) == SUNDAY
+    # After today's window: tomorrow's.
+    late = datetime(2026, 10, 14, 23, 0, tzinfo=timezone.utc)
+    assert svc.next_window_open(c, late) == datetime(2026, 10, 15, 13, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_a_short_day_searches_again_a_few_hours_later(db_session, monkeypatch):
+    c = await _campaign(db_session)
+    runs = []
+
+    async def fake_search(db, campaign):
+        runs.append(1)
+        return 0
+
+    monkeypatch.setattr(svc, "_search_companies", fake_search)
+    c.last_discovery_on = date(2026, 1, 1)  # skip the document seed
+    assert await svc.discovery_due(db_session, c, MIDWEEK)
+    await svc.discover_prospects(db_session, c, MIDWEEK)
+    log = (await db_session.execute(select(CampaignDailyLog).where(
+        CampaignDailyLog.campaign_id == c.id))).scalars().one()
+    assert log.discovery_runs == 1 and svc._aware(log.last_discovery_at) == MIDWEEK
+    # Nothing in hand, but too soon.
+    assert not await svc.discovery_due(db_session, c, MIDWEEK + timedelta(hours=1))
+    later = MIDWEEK + timedelta(hours=2, minutes=1)
+    assert await svc.discovery_due(db_session, c, later)
+    await svc.discover_prospects(db_session, c, later)
+    await svc.discover_prospects(db_session, c, later + timedelta(hours=3))
+    # Three searches a day on its own, then it waits for tomorrow.
+    assert not await svc.discovery_due(db_session, c, later + timedelta(hours=6))
+    assert len(runs) == 3
+
+
+@pytest.mark.asyncio
+async def test_no_top_up_while_there_is_a_days_worth_to_send(db_session):
+    c = await _campaign(db_session, daily_send_limit=5, last_discovery_on=svc.local_today(
+        Campaign(timezone="America/Toronto"), MIDWEEK))
+    db_session.add(CampaignDailyLog(campaign_id=c.id, date=svc.local_today(c, MIDWEEK), prospects_found=5,
+                                    emails_sent=0, emails_bounced=0, errors=[], discovery_runs=1,
+                                    last_discovery_at=MIDWEEK - timedelta(hours=5)))
+    for i in range(5):
+        ct = await _contact(db_session, f"p{i}@full{i}.com")
+        db_session.add(CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=ct.email, status="queued"))
+    await db_session.commit()
+    assert not await svc.discovery_due(db_session, c, MIDWEEK)
+
+
+@pytest.mark.asyncio
+async def test_find_more_prospects_dispatches_and_is_capped(client, db_session, monkeypatch):
+    from app.tasks import campaigns as tasks
+
+    sent = []
+    monkeypatch.setattr(tasks.discover_campaign_now, "delay", lambda *a: sent.append(a))
+    c = await _campaign(db_session)
+    url = f"/api/v1/campaigns/{c.id}/discover"
+    r = await client.post(url)
+    assert r.status_code == 200, r.text
+    assert r.json()["processing"] == "dispatched" and sent == [(str(c.org_id), str(c.id))]
+    db_session.add(CampaignDailyLog(campaign_id=c.id, date=svc.local_today(c), prospects_found=0, emails_sent=0,
+                                    emails_bounced=0, errors=[], discovery_runs=svc.MANUAL_DISCOVERY_RUNS))
+    await db_session.commit()
+    assert (await client.post(url)).status_code == 429
+    c.status = "paused"
+    await db_session.commit()
+    assert (await client.post(url)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_discover_now_searches_then_processes(db_session, monkeypatch):
+    c = await _campaign(db_session, last_discovery_on=date(2026, 1, 1))
+    calls = []
+
+    async def fake_search(db, campaign):
+        calls.append("search")
+        return 2
+
+    monkeypatch.setattr(svc, "_search_companies", fake_search)
+    out = await svc.discover_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: None)
+    assert calls == ["search"] and out["discovered"] == 2 and "scheduled" in out
+
+
+@pytest.mark.asyncio
+async def test_the_campaign_says_when_its_window_opens(client, db_session):
+    c = await _campaign(db_session)
+    body = (await client.get(f"/api/v1/campaigns/{c.id}")).json()
+    assert isinstance(body["window_open"], bool)
+    assert body["send_window_opens_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_turning_on_weekends_sends_what_is_approved(client, db_session, monkeypatch):
+    from app.tasks import campaigns as tasks
+
+    sent = []
+    monkeypatch.setattr(tasks.send_approved_now, "delay", lambda *a: sent.append(a))
+    monkeypatch.setattr(svc, "window_open", lambda c, now=None: bool(c.send_on_weekends))
+    c = await _campaign(db_session)
+    r = await client.patch(f"/api/v1/campaigns/{c.id}", json={"send_on_weekends": True})
+    assert r.status_code == 200, r.text
+    assert sent == [(str(c.org_id), str(c.id))]
+    # Renaming doesn't touch the window: nothing dispatched.
+    await client.patch(f"/api/v1/campaigns/{c.id}", json={"name": "New name"})
+    assert len(sent) == 1

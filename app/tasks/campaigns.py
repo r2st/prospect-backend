@@ -88,6 +88,22 @@ def send_approved_now(org_id: str, campaign_id: str):
     return _run_async(_run())
 
 
+@celery_app.task(name="app.tasks.campaigns.discover_campaign_now")
+def discover_campaign_now(org_id: str, campaign_id: str):
+    """Search for more companies now — the dashboard's "Find more prospects"."""
+
+    async def _run():
+        from app.database_celery import celery_session
+        from app.org_context import org_scope
+        from app.services.campaigns import discover_now
+
+        async with org_scope(uuid.UUID(org_id)):
+            async with celery_session() as db:
+                return await discover_now(db, uuid.UUID(campaign_id), schedule=_schedule)
+
+    return _run_async(_run())
+
+
 @celery_app.task(name="app.tasks.campaigns.process_new_prospects")
 def process_new_prospects(org_id: str, campaign_id: str):
     """Verify, draft and schedule a campaign's added contacts now."""
