@@ -100,6 +100,10 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set when an admin deletes the user. Deletion is soft: the row (and the
+    # attribution hanging off it) stays, is_active goes False so every auth
+    # gate refuses it, and the admin console stops listing it.
+    deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     # Multi-tenant org membership. NULL is reserved for ``platform_admin`` users,
     # who are not bound to any single org and bypass org-level isolation. Every
     # other role has a non-null org_id (enforced at the application layer).

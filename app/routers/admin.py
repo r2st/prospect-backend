@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -29,7 +30,12 @@ def _is_platform_admin(user: User) -> bool:
 
 
 def _scope_users_to_org(query, admin: User):
-    """Restrict a User query to the admin's org (no-op for a platform admin)."""
+    """Restrict a User query to the admin's org (no-op for a platform admin).
+
+    Soft-deleted users are out of scope for everyone: they don't list, and
+    get/update/reset/delete answer 404 as if they were gone.
+    """
+    query = query.where(User.deleted_at.is_(None))
     if not _is_platform_admin(admin):
         query = query.where(User.org_id == admin.org_id)
     return query
@@ -76,7 +82,11 @@ async def create_user(
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="A user with this email already exists",
+            detail=(
+                "This email belongs to a deleted user"
+                if existing.deleted_at is not None
+                else "A user with this email already exists"
+            ),
         )
 
     role = normalize_role(payload.role)
@@ -243,11 +253,12 @@ async def delete_user(
     admin: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Soft-delete a user (deactivate). Admin only. Cannot delete yourself.
+    """Soft-delete a user. Admin only. Cannot delete yourself.
 
-    We soft-delete — set ``is_active = False`` — rather than hard-deleting so
-    that historical attribution (who contacted which client, who sent which
-    email) is preserved. The account can no longer log in.
+    We soft-delete — stamp ``deleted_at`` and set ``is_active = False`` —
+    rather than hard-deleting so that historical attribution (who contacted
+    which client, who sent which email) is preserved. The account can no
+    longer log in and drops out of the admin console.
     """
     if user_id == admin.id:
         raise HTTPException(
@@ -262,6 +273,7 @@ async def delete_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     user.is_active = False
+    user.deleted_at = datetime.now(timezone.utc)
     await db.flush()
     await db.refresh(user)
     logger.info("Admin %s soft-deleted user %s", admin.email, user.email)

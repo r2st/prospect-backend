@@ -123,6 +123,7 @@ class UserRead(BaseModel):
     created_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
+    deleted_at: Optional[datetime] = None
 
 
 class UserCreateResponse(UserRead):

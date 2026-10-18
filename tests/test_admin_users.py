@@ -146,10 +146,66 @@ async def test_admin_cannot_demote_self(client: AsyncClient, admin_user, auth_he
 async def test_soft_delete_user(client: AsyncClient, admin_user, agent_user, auth_headers):
     resp = await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
     assert resp.status_code == 200, resp.text
-    assert resp.json()["is_active"] is False
-    # Still listed (soft delete preserves history).
+    body = resp.json()
+    assert body["is_active"] is False
+    assert body["deleted_at"] is not None
+    # Gone from the console, unlike a deactivated user.
     listing = await client.get(USERS, headers=auth_headers(admin_user))
-    assert any(u["email"] == "agent@landline.app" for u in listing.json())
+    assert all(u["email"] != "agent@landline.app" for u in listing.json())
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_keeps_the_row(
+    client: AsyncClient, admin_user, agent_user, auth_headers, db_session
+):
+    from sqlalchemy import select
+
+    from app.models.user import User
+
+    await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
+    row = (
+        await db_session.execute(
+            select(User).where(User.id == agent_user.id).execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert row.deleted_at is not None
+    assert row.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_user_cannot_log_in(client: AsyncClient, admin_user, agent_user, auth_headers):
+    await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "agent@landline.app", "password": "agentpass123"}
+    )
+    assert login.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_deleted_user_cannot_be_reactivated_or_deleted_again(
+    client: AsyncClient, admin_user, agent_user, auth_headers
+):
+    await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
+    patch = await client.patch(
+        _user_url(agent_user.id), headers=auth_headers(admin_user), json={"is_active": True}
+    )
+    assert patch.status_code == 404
+    again = await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
+    assert again.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_recreating_a_deleted_users_email_409_says_why(
+    client: AsyncClient, admin_user, agent_user, auth_headers
+):
+    await client.delete(_user_url(agent_user.id), headers=auth_headers(admin_user))
+    resp = await client.post(
+        USERS,
+        headers=auth_headers(admin_user),
+        json={"email": "agent@landline.app", "name": "Back", "role": "agent", "password": "initialpw123"},
+    )
+    assert resp.status_code == 409
+    assert "deleted" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
