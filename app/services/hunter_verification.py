@@ -204,13 +204,18 @@ class HunterVerificationService:
         Returns ``(data, None)`` on success or ``(None, reason)`` on failure.
         Never raises — every caller treats a failure as fail-open.
         """
-        query = {**params, "api_key": self.api_key}
+        # The key goes in a header, never the query string: httpx logs every
+        # request URL at INFO, so ``?api_key=`` put the credential in every log
+        # line of every sweep — and logs are shipped and retained.
+        headers = {"X-API-KEY": self.api_key}
         delay = _BACKOFF_BASE
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
                 async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                    response = await client.get(f"{self.base_url}{path}", params=query)
+                    response = await client.get(
+                        f"{self.base_url}{path}", params=params, headers=headers
+                    )
 
                 # Retryable: rate limit or a server-side wobble.
                 if response.status_code == 429 or response.status_code >= 500:

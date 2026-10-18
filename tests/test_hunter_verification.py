@@ -66,8 +66,8 @@ class _FakeClient:
     async def __aexit__(self, *args):
         return False
 
-    async def get(self, url, params=None):
-        _FakeClient.calls.append({"url": url, "params": params or {}})
+    async def get(self, url, params=None, headers=None):
+        _FakeClient.calls.append({"url": url, "params": params or {}, "headers": headers or {}})
         if _FakeClient.raise_exc is not None:
             raise _FakeClient.raise_exc
         if not _FakeClient.responses:
@@ -788,3 +788,14 @@ async def test_background_sweeps_can_be_switched_off(monkeypatch):
     monkeypatch.setattr(verification, "get_hunter_service", _boom)
     out = await verification._sweep(_boom, 200, "verify_pending_contacts")
     assert out == {"status": "skipped", "reason": "sweeps_disabled", "checked": 0}
+
+
+@pytest.mark.asyncio
+async def test_the_api_key_travels_in_a_header_never_the_url(hunter_on):
+    """httpx logs request URLs at INFO; a key in the query string is a key in the logs."""
+    _FakeClient.responses = [_FakeResponse(200, _payload())]
+    await get_hunter_service().verify_email("ana@acme.com")
+    (call,) = _FakeClient.calls
+    assert call["headers"] == {"X-API-KEY": "test-key"}
+    assert "test-key" not in call["url"]
+    assert "test-key" not in str(call["params"]) and "api_key" not in call["params"]

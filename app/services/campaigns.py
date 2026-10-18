@@ -429,6 +429,36 @@ def guess_email(first_name: Optional[str], domain: Optional[str]) -> Optional[st
     return f"{local}@{d}"
 
 
+# Words an LLM puts in a name field when it has no name: "John K. (Placeholder
+# for CTO)" cost a Hunter search and produced john@veeva.com.
+_PLACEHOLDER_WORDS = {
+    "placeholder", "unknown", "tbd", "n/a", "na", "none", "null", "example",
+    "contact", "name", "firstname", "lastname", "redacted", "anonymous",
+    "ceo", "cto", "cfo", "coo", "cio", "ciso", "vp", "head", "director",
+    "manager", "founder", "owner", "team", "sales", "info", "admin", "support",
+}
+_NOT_A_NAME = re.compile(r"[()\[\]{}<>@#/\\|_:;!?*=+0-9]")
+
+
+def plausible_person_name(first_name: Optional[str], last_name: Optional[str]) -> bool:
+    """Whether a discovered contact's name could be a real person's.
+
+    A discovered "contact" is only worth a Hunter search, or a guessed address,
+    if it names someone. Rejects brackets/digits/emails, placeholder and
+    job-title words, and the textbook dummies.
+    """
+    first = (first_name or "").strip()
+    if len(first.strip(".")) < 2:
+        return False
+    full = f"{first} {(last_name or '').strip()}".strip()
+    if _NOT_A_NAME.search(full):
+        return False
+    words = {w.strip(".,'-").lower() for w in full.split()}
+    if words & _PLACEHOLDER_WORDS:
+        return False
+    return full.lower() not in {"john doe", "jane doe", "john smith"}
+
+
 # A prospect is only ever scheduled once its contact's address carries this
 # verdict. Pattern guesses and finder results alike start unverified.
 VERIFIED = "deliverable"
@@ -476,16 +506,23 @@ async def _resolve_missing_emails(db: AsyncSession, company_ids: list[uuid.UUID]
     for company in companies:
         if company.id in has_email:
             continue
-        contact = (
+        named = (
             await db.execute(
                 select(Contact)
                 .where(Contact.company_id == company.id, Contact.first_name.isnot(None))
                 .order_by(Contact.created_at, Contact.id)
-                .limit(1)
             )
-        ).scalars().first()
+        ).scalars().all()
+        contact = next(
+            (c for c in named if plausible_person_name(c.first_name, c.last_name)), None
+        )
         if contact is not None:
             targets.append((company, contact))
+        elif named:
+            logger.info(
+                "Campaign discovery: %s has no plausible contact name (%r) — not searching",
+                company.domain, [f"{c.first_name} {c.last_name or ''}".strip() for c in named][:3],
+            )
     if not targets:
         return stats
 
@@ -561,15 +598,44 @@ async def _record_emailless(
     return added
 
 
+KNOWN_DOMAINS_IN_PROMPT = 40
+
+
+async def _known_domains(db: AsyncSession) -> list[str]:
+    """Domains this org's campaigns already hold, most recent first (org-scoped read)."""
+    rows = (
+        await db.execute(
+            select(Company.domain, func.max(CampaignProspect.created_at).label("seen"))
+            .join(CampaignProspect, CampaignProspect.company_id == Company.id)
+            .where(Company.domain.isnot(None))
+            .group_by(Company.domain)
+            .order_by(func.max(CampaignProspect.created_at).desc(), Company.domain)
+            .limit(KNOWN_DOMAINS_IN_PROMPT)
+        )
+    ).all()
+    return [d for d, _ in rows]
+
+
 async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     from app.services import gemini_discovery
     from app.services.ingestion import get_ingestion_service
 
     icp = Icp.model_validate(campaign.icp_json or {})
+    query = icp.search_query or icp.summary
+    # The same ICP asked again returns the same companies — and an ungrounded
+    # model returns the same household names every day — all of which
+    # queue_contacts then drops as already prospected, so the campaign stalls
+    # after day one. Tell the model what it has already given us.
+    seen = await _known_domains(db)
+    if seen:
+        query = (
+            f"{query}\n\nDo not include any of these companies; they have already "
+            f"been found: {', '.join(seen)}."
+        )
     found = await gemini_discovery.search_companies(
         db,
         campaign.org_id,
-        query=icp.search_query or icp.summary,
+        query=query,
         industry=", ".join(icp.target_industries[:3]),
         location=", ".join(icp.target_locations[:3]),
         keywords=icp.keywords[:5],

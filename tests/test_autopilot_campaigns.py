@@ -455,6 +455,7 @@ async def _run_search(db_session, monkeypatch, hunter, companies):
     from app.services import gemini_discovery, hunter_verification, ingestion
 
     async def fake_search(*a, **kw):
+        _run_search.last_query = kw.get("query")
         return SimpleNamespace(records=[], provider="groq")
 
     class FakeIngest:
@@ -692,3 +693,71 @@ async def test_deleting_an_active_campaign_stops_it_and_keeps_the_sent_record(cl
     # Kept, so the address is never mailed again by a later campaign.
     assert sent.status == "sent"
     assert await svc.run_campaigns_tick(db_session, now=MIDWEEK, schedule=lambda *a: None) == []
+
+
+@pytest.mark.parametrize(
+    "first, last, ok",
+    [
+        ("Tobi", "Lütke", True),
+        ("Mary-Jane", "O'Neil", True),
+        ("Priya", None, True),
+        ("John", "K. (Placeholder for CTO)", False),  # seen live, cost a Hunter search
+        ("CTO", None, False),
+        ("Head", "of Engineering", False),
+        ("J", None, False),
+        ("John", "Doe", False),
+        ("Sales", "Team", False),
+        ("Ana", "Li2", False),
+        ("info@acme.com", None, False),
+    ],
+)
+def test_plausible_person_name(first, last, ok):
+    assert svc.plausible_person_name(first, last) is ok
+
+
+@pytest.mark.asyncio
+async def test_a_placeholder_contact_spends_no_hunter_credit(db_session, monkeypatch):
+    co, ct = await _named(db_session, "veeva.com", first="John", last="K. (Placeholder for CTO)")
+    hunter = _FakeHunter()
+    campaign, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 0
+    assert hunter.find_calls == [] and hunter.verify_calls == []
+    await db_session.refresh(ct)
+    assert ct.email is None
+    rows = (await db_session.execute(
+        select(CampaignProspect).where(CampaignProspect.campaign_id == campaign.id)
+    )).scalars().all()
+    assert [r.status for r in rows] == ["no_email"]
+
+
+@pytest.mark.asyncio
+async def test_a_real_name_is_preferred_over_an_earlier_placeholder(db_session, monkeypatch):
+    co, _ = await _named(db_session, "mixed.com", first="CTO", last=None)
+    real = Contact(company_id=co.id, first_name="Ravi", last_name="Iyer")
+    db_session.add(real)
+    await db_session.commit()
+    hunter = _FakeHunter(finds={"mixed.com": "ravi.iyer@mixed.com"})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 1
+    await db_session.refresh(real)
+    assert real.email == "ravi.iyer@mixed.com"
+
+
+@pytest.mark.asyncio
+async def test_discovery_tells_the_model_which_companies_it_already_found(db_session, monkeypatch):
+    old = await _campaign(db_session)
+    seen = await _contact(db_session, "x@already.com")
+    db_session.add(CampaignProspect(campaign_id=old.id, company_id=seen.company_id,
+                                    contact_id=seen.id, to_email=seen.email, status="skipped"))
+    await db_session.commit()
+    co, _ = await _named(db_session, "fresh.com")
+    await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
+    assert _run_search.last_query.startswith("We sell widgets")
+    assert "already.com" in _run_search.last_query
+
+
+@pytest.mark.asyncio
+async def test_a_first_search_sends_the_bare_icp(db_session, monkeypatch):
+    co, _ = await _named(db_session, "first.com")
+    await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
+    assert _run_search.last_query == "We sell widgets"
