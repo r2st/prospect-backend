@@ -388,3 +388,64 @@ async def test_a_route_crash_is_not_reported_as_bad_credentials(client, db_sessi
     except RuntimeError:
         return  # propagated as a server error — correct
     assert resp.status_code != 401, resp.text
+
+
+# ── guessed emails for LLM-discovered contacts ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "first, domain, expected",
+    [
+        ("Jane", "acme.com", "jane@acme.com"),
+        ("  JANE ", "ACME.com", "jane@acme.com"),
+        ("Mary Ann", "acme.com", "mary@acme.com"),
+        ("José", "acme.io", "jose@acme.io"),
+        ("O'Neil", "acme.com", "oneil@acme.com"),
+        ("Jane", "https://www.acme.com/about", "jane@acme.com"),
+        ("Jane", "www.acme.co.uk:443", "jane@acme.co.uk"),
+        (None, "acme.com", None),
+        ("", "acme.com", None),
+        ("Jane", None, None),
+        ("Jane", "localhost", None),
+        ("李", "acme.com", None),
+    ],
+)
+def test_guess_email_is_firstname_at_domain(first, domain, expected):
+    assert svc.guess_email(first, domain) == expected
+
+
+@pytest.mark.asyncio
+async def test_search_fills_missing_emails_so_named_contacts_become_prospects(db_session, monkeypatch):
+    from types import SimpleNamespace
+
+    from app.services import gemini_discovery, ingestion
+
+    campaign = await _campaign(db_session)
+    co = Company(name="Guessco", domain="guessco.com", source="manual")
+    nodomain = Company(name="Nodomain Inc", source="manual")
+    db_session.add_all([co, nodomain])
+    await db_session.flush()
+    named = Contact(company_id=co.id, first_name="Priya", last_name="Shah")
+    orphan = Contact(company_id=nodomain.id, first_name="Sam", last_name="Lee")
+    keep = await _contact(db_session, "real@kept.com")
+    db_session.add_all([named, orphan])
+    await db_session.commit()
+
+    async def fake_search(*a, **kw):
+        return SimpleNamespace(records=[], provider="groq")
+
+    class FakeIngest:
+        async def ingest(self, db, records):
+            ids = [co.id, nodomain.id, keep.company_id]
+            return SimpleNamespace(outcomes=[SimpleNamespace(company_id=i) for i in ids])
+
+    monkeypatch.setattr(gemini_discovery, "search_companies", fake_search)
+    monkeypatch.setattr(ingestion, "get_ingestion_service", lambda: FakeIngest())
+
+    assert await svc._search_companies(db_session, campaign) == 2
+    await db_session.refresh(named)
+    await db_session.refresh(orphan)
+    await db_session.refresh(keep)
+    assert named.email == "priya@guessco.com"
+    assert orphan.email is None  # no domain → no guess
+    assert keep.email == "real@kept.com"  # a real address is never overwritten

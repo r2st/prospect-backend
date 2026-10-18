@@ -46,6 +46,7 @@ import html
 import logging
 import random
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -404,6 +405,56 @@ async def _seed_from_documents(db: AsyncSession, campaign: Campaign) -> int:
     return await queue_contacts(db, campaign, list(contacts), source="document")
 
 
+def guess_email(first_name: Optional[str], domain: Optional[str]) -> Optional[str]:
+    """``firstname@domain`` — the commonest B2B pattern — or None if either half is unusable.
+
+    Discovery LLMs name people reliably and their addresses almost never, so a
+    contact arrives with a name and no email. The guess is unverified: it is left
+    with ``email_status`` NULL so the send path's MX/verification checks still run.
+    """
+    if not first_name or not domain:
+        return None
+    d = domain.strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d).split("/", 1)[0].split(":", 1)[0]
+    d = d.removeprefix("www.").strip(".")
+    if "." not in d or not re.fullmatch(r"[a-z0-9.-]+", d):
+        return None
+    tokens = first_name.strip().split()
+    if not tokens:
+        return None
+    ascii_name = unicodedata.normalize("NFKD", tokens[0]).encode("ascii", "ignore").decode()
+    local = re.sub(r"[^a-z0-9]", "", ascii_name.lower())
+    if not local:
+        return None
+    return f"{local}@{d}"
+
+
+async def _fill_guessed_emails(db: AsyncSession, company_ids: list[uuid.UUID]) -> int:
+    """Give named, address-less contacts at these companies a ``firstname@domain`` guess."""
+    rows = (
+        await db.execute(
+            select(Contact, Company.domain)
+            .join(Company, Company.id == Contact.company_id)
+            .where(
+                Contact.company_id.in_(company_ids),
+                or_(Contact.email.is_(None), Contact.email == ""),
+                Contact.first_name.isnot(None),
+                Company.domain.isnot(None),
+            )
+        )
+    ).all()
+    filled = 0
+    for contact, domain in rows:
+        guess = guess_email(contact.first_name, domain)
+        if guess:
+            contact.email = guess
+            filled += 1
+    if filled:
+        await db.flush()
+        logger.info("Campaign discovery: guessed %d email(s) as firstname@domain", filled)
+    return filled
+
+
 async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     from app.services import gemini_discovery
     from app.services.ingestion import get_ingestion_service
@@ -424,6 +475,7 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     company_ids = [o.company_id for o in result.outcomes if o.company_id]
     if not company_ids:
         return 0
+    await _fill_guessed_emails(db, company_ids)
     rows = (
         await db.execute(
             select(Contact)
@@ -710,9 +762,14 @@ async def schedule_sends(
 ) -> int:
     """Hand this tick's sends to ``schedule(org_id, prospect_id, countdown_seconds)``."""
     now = _aware(now)
-    if not window_open(campaign, now):
+    is_open = window_open(campaign, now)
+    if not is_open:
+        logger.info("schedule_sends campaign=%s: window closed at %s", campaign.id, now)
         return 0
-    if await sending_account(db, campaign) is None:
+    acct = await sending_account(db, campaign)
+    if acct is None:
+        logger.info("schedule_sends campaign=%s: no sending account (gmail_account_id=%s)",
+                    campaign.id, campaign.gmail_account_id)
         campaign.status, campaign.pause_reason = "paused", "gmail_disconnected"
         await log_error(
             db, campaign,
@@ -732,8 +789,11 @@ async def schedule_sends(
             )
         )
     ).scalar_one()
-    quota = ramp_cap(campaign) - await sent_today(db, campaign, now) - in_flight
+    cap, already_sent = ramp_cap(campaign), await sent_today(db, campaign, now)
+    quota = cap - already_sent - in_flight
     if quota <= 0:
+        logger.info("schedule_sends campaign=%s: no quota (ramp_cap=%d sent_today=%d in_flight=%d)",
+                    campaign.id, cap, already_sent, in_flight)
         return 0
     ready = (
         await db.execute(
@@ -750,9 +810,17 @@ async def schedule_sends(
     _, window_end = window_bounds(campaign, now)
     horizon = min(now + TICK, window_end)
     at = max(now, _aware(campaign.next_send_at) if campaign.next_send_at else now)
+    logger.info(
+        "schedule_sends campaign=%s: window=%s, account=%s, quota=%d, ready=%d, "
+        "now=%s, next_send_at=%s, at=%s, horizon=%s, window_end=%s",
+        campaign.id, is_open, acct is not None, quota, len(ready),
+        now, campaign.next_send_at, at, horizon, window_end,
+    )
     scheduled = 0
     for p in ready:
         if at >= horizon:
+            logger.info("schedule_sends campaign=%s: at=%s is past horizon=%s; stopping",
+                        campaign.id, at, horizon)
             break
         p.scheduled_for = at
         await db.flush()
