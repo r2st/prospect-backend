@@ -862,7 +862,12 @@ async def approve_prospect(
     await db.refresh(p)
     out = ProspectOut.model_validate(p, from_attributes=True)
     if c.status == "active":
-        out.instant_send = _dispatch_instant_send(c)
+        # Spam protection is the only thing that holds an approval: with
+        # today's warm-up allowance spent, it waits for tomorrow's.
+        if await svc.sent_today(db, c) >= svc.send_cap(c):
+            out.instant_send = "limit_reached"
+        else:
+            out.instant_send = _dispatch_instant_send(c)
     return out
 
 

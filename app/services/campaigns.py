@@ -76,9 +76,10 @@ from app.services import org_gemini, suppression
 logger = logging.getLogger(__name__)
 
 TICK = timedelta(minutes=15)
-# Approved emails go out as soon as they're approved; this only spaces a burst
-# of approvals so a mailbox doesn't fire them all in the same second.
-GAP_SECONDS = (20, 60)
+# Approved emails go out as soon as they're approved, at any hour. A burst of
+# approvals is spaced a random 60–120s apart so the mailbox doesn't look like a
+# bot to the receiving providers' spam filters.
+GAP_SECONDS = (60, 120)
 WARMUP_STEP = 5
 MAX_DAILY_LIMIT = 100
 BOUNCE_PAUSE_RATE = 0.05
@@ -176,12 +177,13 @@ def next_window_open(campaign: Campaign, now: Optional[datetime] = None) -> Opti
 
 
 def send_cap(campaign: Campaign) -> int:
-    """How many approved emails may go out today: the campaign's daily limit.
+    """How many approved emails may go out today.
 
-    An approval is the operator's say-so to send, so it isn't held for the
-    send window or the warm-up ramp — only the ceiling the operator set.
+    Only spam protection holds an approved email back, never the time of day:
+    the warm-up ramp, capped by the campaign's daily limit. A new mailbox that
+    jumps straight to full volume gets its mail filtered as spam.
     """
-    return max(0, campaign.daily_send_limit)
+    return ramp_cap(campaign)
 
 
 def ramp_cap(campaign: Campaign) -> int:
@@ -1861,7 +1863,7 @@ async def send_prospect(
     if await sent_today(db, campaign, now) >= send_cap(campaign):
         p.scheduled_for = None
         await db.commit()
-        return SendOutcome("held", "campaign daily limit reached")
+        return SendOutcome("held", "warm-up or daily send limit reached")
     account = await sending_account(db, campaign)
     if account is None:
         p.scheduled_for = None
@@ -2047,10 +2049,11 @@ async def send_approved_now(
     otherwise be held) and ``schedule_sends``. No discovery and no drafting —
     those spend AI and Hunter budget and belong to the beat.
 
-    Same ``schedule_sends`` as the tick, at any hour: no send window and no
-    warm-up ramp — only the campaign's daily limit, verified-only, and the
-    20–60s gap between sends (``next_send_at``). So the first approval goes out
-    now and a burst of approvals follows within a minute or two. The
+    Same ``schedule_sends`` as the tick, at any hour: no send window, only the
+    spam-protection gates — the warm-up ramp and daily limit (``send_cap``),
+    verified-only, and the 60–120s gap between sends (``next_send_at``). So
+    the first approval goes out now and a burst follows a minute or two apart.
+    The
     ``scheduled_for`` lease keeps this and a concurrent tick from scheduling
     the same row twice, and the claim in ``send_prospect`` makes a duplicate
     task harmless anyway. Whatever this can't schedule — limit spent, past the

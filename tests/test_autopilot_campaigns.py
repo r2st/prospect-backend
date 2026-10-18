@@ -144,8 +144,8 @@ async def test_create_campaign_builds_icp_and_picks_the_callers_mailbox(client, 
     assert dispatched == [(str(APPREND_ORG_ID), body["id"])]
     assert body["icp_json"]["target_industries"] == ["Manufacturing"]
     assert body["gmail_account_id"] == str(acct.id)
-    # Approved emails aren't held to the warm-up ramp: today's cap is the limit.
-    assert body["todays_cap"] == 40 and body["status"] == "active"
+    # Warm-up day 1: 5, however high the daily limit.
+    assert body["todays_cap"] == 5 and body["status"] == "active"
 
     listed = await client.get("/api/v1/campaigns")
     assert [c["id"] for c in listed.json()] == [body["id"]]
@@ -232,7 +232,7 @@ async def test_an_address_is_never_queued_twice_across_campaigns(db_session):
 # ── sending ──────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_schedule_sends_every_approval_now_spaced_20_to_60_seconds(db_session):
+async def test_schedule_spaces_sends_60_to_120_seconds_and_respects_the_ramp(db_session):
     c = await _campaign(db_session)
     for i in range(8):
         ct = await _contact(db_session, f"p{i}@acme{i}.com", verified=True)
@@ -244,12 +244,11 @@ async def test_schedule_sends_every_approval_now_spaced_20_to_60_seconds(db_sess
     calls = []
     n = await svc.schedule_sends(db_session, c, MIDWEEK,
                                  schedule=lambda org, pid, cd: calls.append(cd))
-    # Warm-up day 1 used to cap this at 5; an approval now goes regardless,
-    # and 8 sends 20–60s apart all fit in the tick.
-    assert n == 8 and len(calls) == 8
+    # Warm-up day 1 caps 8 approvals at 5; 60–120s apart they all fit the tick.
+    assert n == 5 and len(calls) == 5
     assert calls[0] == 0
     gaps = [b - a for a, b in zip(calls, calls[1:])]
-    assert all(20 <= g <= 60 for g in gaps)
+    assert all(60 <= g <= 120 for g in gaps)
 
 
 @pytest.mark.asyncio
@@ -1455,3 +1454,41 @@ async def test_turning_on_weekends_sends_what_is_approved(client, db_session, mo
     # Renaming doesn't touch the window: nothing dispatched.
     await client.patch(f"/api/v1/campaigns/{c.id}", json={"name": "New name"})
     assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_prospect_holds_once_the_warm_up_allowance_is_spent(db_session):
+    c = await _campaign(db_session)  # warm-up day 1: 5 a day
+    for i in range(5):
+        ct = await _contact(db_session, f"done{i}@doneco{i}.com", verified=True)
+        db_session.add(CampaignProspect(
+            campaign_id=c.id, contact_id=ct.id, to_email=f"done{i}@doneco{i}.com", status="sent",
+            email_subject="s", email_body="b", sent_at=MIDWEEK - timedelta(minutes=i + 1),
+        ))
+    p = await _approved(db_session, c, "sixth@sixthco.com")
+    out = await svc.send_prospect(db_session, p.id, MIDWEEK)
+    assert out.status == "held" and "warm-up" in out.detail
+
+
+@pytest.mark.asyncio
+async def test_approving_past_the_warm_up_allowance_says_so(client, db_session, monkeypatch):
+    from app.tasks import campaigns as campaign_tasks
+
+    c = await _campaign(db_session, review_before_send=True)
+    monkeypatch.setattr(svc, "sent_today", _const(5))  # day 1 allowance spent
+    p = CampaignProspect(campaign_id=c.id, to_email="x@acme.com", status="draft_created",
+                         email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    dispatched = []
+    monkeypatch.setattr(campaign_tasks.send_approved_now, "delay", lambda *a: dispatched.append(a))
+
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/approve")
+    assert r.json()["instant_send"] == "limit_reached"
+    assert dispatched == []
+
+
+def _const(value):
+    async def _f(*a, **kw):
+        return value
+    return _f
