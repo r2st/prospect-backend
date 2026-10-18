@@ -367,6 +367,9 @@ async def resolve_sender_info(
     )
 
 
+POWERED_BY_URL = "https://prospect.doaide.com"
+
+
 def _make_unsubscribe_url(contact_email: str) -> str:
     """Generate the signed unsubscribe URL for a contact.
 
@@ -386,29 +389,24 @@ def _make_unsubscribe_url(contact_email: str) -> str:
 def _unsubscribe_footer_text(contact_email: str) -> str:
     """Plain-text unsubscribe footer for the text/plain part."""
     unsubscribe_url = _make_unsubscribe_url(contact_email)
-    settings = get_settings()
     return (
         "\n\n—\n"
-        f"{settings.company_name}\n"
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        f"{settings.company_postal_address}"
+        f"Powered by DoAide Prospect — {POWERED_BY_URL}"
     )
 
 
 def _unsubscribe_footer_html(contact_email: str) -> str:
     """HTML unsubscribe footer with proper inline styles."""
     unsubscribe_url = _make_unsubscribe_url(contact_email)
-    settings = get_settings()
-    address = html_mod.escape(settings.company_postal_address)
-    name = html_mod.escape(settings.company_name)
     return (
         '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0 12px 0">'
         '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
-        f'{name} &middot; {address}</p>'
-        '<p style="margin:0;font-size:11px;color:#9ca3af">'
         'Don\'t want these emails? Reply UNSUBSCRIBE or '
         f'<a href="{unsubscribe_url}" style="color:#9ca3af">unsubscribe here</a></p>'
+        '<p style="margin:0;font-size:11px;color:#9ca3af">'
+        f'<a href="{POWERED_BY_URL}" style="color:#9ca3af">Powered by DoAide Prospect</a></p>'
     )
 
 

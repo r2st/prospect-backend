@@ -60,10 +60,9 @@ class EmailSender:
         unsubscribe_url = make_unsubscribe_url(contact_email)
         return (
             "\n\n—\n"
-            f"{settings.company_name}\n"
             f"Don't want these emails? Reply UNSUBSCRIBE or click: "
             f"{unsubscribe_url}\n"
-            f"{settings.company_postal_address}"
+            "Powered by DoAide Prospect — https://prospect.doaide.com"
         )
 
     def _send_raw(

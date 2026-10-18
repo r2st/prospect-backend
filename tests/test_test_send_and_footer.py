@@ -10,23 +10,23 @@ from app.config import get_settings
 from app.services import system_settings
 
 
-# --- Footer: full postal address ---
+# --- Footer: unsubscribe + DoAide attribution only ---
 
 
-def test_footer_uses_full_postal_address():
+def test_footer_is_unsubscribe_and_powered_by_only():
     from app.services.email_dispatch import _unsubscribe_footer_text, _unsubscribe_footer_html
 
     settings = get_settings()
     text = _unsubscribe_footer_text("prospect@example.com")
     html = _unsubscribe_footer_html("prospect@example.com")
 
-    # A real postal address (not just a city) with a postal code + country.
-    assert settings.company_postal_address in text
-    assert settings.company_postal_address in html
-    assert settings.company_name in text
-    # The default is a full address, not the old city-only string.
-    assert settings.company_postal_address != "Toronto, ON, Canada"
-    assert any(ch.isdigit() for ch in settings.company_postal_address)  # has a postal code
+    for footer in (text, html):
+        assert "unsubscribe" in footer.lower()
+        assert "Powered by DoAide Prospect" in footer
+        assert "https://prospect.doaide.com" in footer
+        assert settings.company_postal_address not in footer
+        assert settings.company_name not in footer
+    assert '<a href="https://prospect.doaide.com"' in html
 
 
 # --- Test-send endpoint ---

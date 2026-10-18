@@ -434,10 +434,11 @@ class TestUnsubscribeCompliance:
         assert "unsubscribe" in footer.lower()
         assert "href=" in footer
 
-    def test_unsubscribe_footer_includes_company_address(self):
+    def test_unsubscribe_footer_has_powered_by_not_address(self):
         from app.services.email_dispatch import _unsubscribe_footer_html
         footer = _unsubscribe_footer_html("test@example.com")
-        assert "Toronto" in footer or "Apprend" in footer
+        assert "Powered by DoAide Prospect" in footer
+        assert "Apprend" not in footer and "Bangalore" not in footer
 
     def test_unsubscribe_footer_text_includes_link(self):
         from app.services.email_dispatch import _unsubscribe_footer_text

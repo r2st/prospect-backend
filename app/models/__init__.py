@@ -36,6 +36,7 @@ from app.models.task import Task
 from app.models.client_health import ClientHealthSnapshot
 from app.models.email_reply import EmailReply
 from app.models.email_signature import EmailSignature
+from app.models.feedback import Feedback
 from app.models.knowledge import IndustryContact, KnowledgeDocument
 from app.models.call import CallTask, CallScript, CallNotification
 from app.models.investor import Investor, InvestorInteraction, InvestorDocument
@@ -118,6 +119,7 @@ __all__ = [
     "Task",
     "ClientHealthSnapshot",
     "EmailSignature",
+    "Feedback",
     "EmailReply",
     "IndustryContact",
     "KnowledgeDocument",
