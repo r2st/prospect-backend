@@ -147,6 +147,10 @@ class ProspectOut(BaseModel):
     replied_at: Optional[datetime] = None
     bounced_at: Optional[datetime] = None
     created_at: datetime
+    # Set on approve only: "dispatched" (sending now, paced), "window_closed"
+    # (goes out when the send window opens) or "unavailable" (the broker
+    # couldn't be reached; the next tick sends it).
+    instant_send: Optional[str] = None
 
 
 class ApproveIn(BaseModel):
@@ -163,6 +167,25 @@ class SkipIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _dispatch_instant_send(c: Campaign) -> str:
+    """Schedule the campaign's approved emails now instead of at the next tick.
+
+    Best-effort, after the commit that made the prospect approved: if the
+    broker is unreachable the 15-minute beat sends it as before. Not dispatched
+    while the window is shut — the task would only find nothing to do.
+    """
+    if not svc.window_open(c):
+        return "window_closed"
+    try:
+        from app.tasks.campaigns import send_approved_now
+
+        send_approved_now.delay(str(c.org_id), str(c.id))
+    except Exception as exc:  # pragma: no cover - broker-dependent
+        logger.warning("Could not dispatch instant send for campaign %s: %s", c.id, exc)
+        return "unavailable"
+    return "dispatched"
+
+
 def _out(c: Campaign) -> dict:
     return {
         "id": c.id,
@@ -492,6 +515,9 @@ async def update_campaign(
         c.status = new_status
     await db.commit()
     await db.refresh(c)
+    if new_status == "active":
+        # Resuming: whatever was approved while paused goes out now.
+        _dispatch_instant_send(c)
     return _out(c)
 
 
@@ -609,7 +635,10 @@ async def approve_prospect(
     p.error = None
     await db.commit()
     await db.refresh(p)
-    return ProspectOut.model_validate(p, from_attributes=True)
+    out = ProspectOut.model_validate(p, from_attributes=True)
+    if c.status == "active":
+        out.instant_send = _dispatch_instant_send(c)
+    return out
 
 
 @router.post("/{campaign_id}/prospects/{prospect_id}/skip", response_model=ProspectOut)

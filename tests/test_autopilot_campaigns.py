@@ -802,3 +802,134 @@ async def test_a_first_search_sends_the_bare_icp(db_session, monkeypatch):
     co, _ = await _named(db_session, "first.com")
     await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
     assert _run_search.last_query == "We sell widgets"
+
+
+# ── instant send on approve ──────────────────────────────────────────────────
+
+async def _approved(db, campaign, email, *, verified=True):
+    ct = await _contact(db, email, verified=verified)
+    p = CampaignProspect(campaign_id=campaign.id, contact_id=ct.id, to_email=email,
+                         status="approved", approved_at=MIDWEEK,
+                         email_subject="Hi", email_body="Hello")
+    db.add(p)
+    await db.commit()
+    return p
+
+
+@pytest.mark.asyncio
+async def test_send_approved_now_schedules_the_approved_email_immediately(db_session):
+    c = await _campaign(db_session)
+    p = await _approved(db_session, c, "now@acme.com")
+    calls = []
+    out = await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
+    assert out["scheduled"] == 1
+    assert calls == [(c.org_id, p.id, 0)]  # no countdown: on the wire now
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_approvals_is_still_paced(db_session):
+    """Instant means the first one goes now — not that the 120–300s gap is gone."""
+    c = await _campaign(db_session)
+    await _approved(db_session, c, "one@first.com")
+    calls = []
+    await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
+    await _approved(db_session, c, "two@second.com")
+    await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
+    assert [cd for *_, cd in calls][0] == 0
+    assert svc.GAP_SECONDS[0] <= calls[1][2] <= svc.GAP_SECONDS[1]
+
+
+@pytest.mark.asyncio
+async def test_an_unverified_approval_is_verified_then_sent_in_the_same_pass(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    c = await _campaign(db_session)
+    p = await _approved(db_session, c, "fresh@acme.com", verified=False)
+    hunter = _FakeHunter()
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: hunter)
+    calls = []
+    out = await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
+    assert hunter.verify_calls == ["fresh@acme.com"]
+    assert out["scheduled"] == 1 and calls[0][1] == p.id
+
+
+@pytest.mark.asyncio
+async def test_instant_send_neither_discovers_nor_drafts(db_session, monkeypatch):
+    c = await _campaign(db_session)
+
+    async def boom(*a, **k):
+        raise AssertionError("instant send must not spend discovery/drafting budget")
+
+    monkeypatch.setattr(svc, "discover_prospects", boom)
+    monkeypatch.setattr(svc, "generate_drafts", boom)
+    out = await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: None)
+    assert out["scheduled"] == 0 and "error" not in out
+
+
+@pytest.mark.asyncio
+async def test_instant_send_respects_the_window_and_campaign_status(db_session):
+    c = await _campaign(db_session)
+    await _approved(db_session, c, "later@acme.com")
+    calls = []
+    out = await svc.send_approved_now(db_session, c.id, now=SATURDAY, schedule=lambda *a: calls.append(a))
+    assert out["scheduled"] == 0 and calls == []  # weekend, weekends off
+
+    c.status = "paused"
+    await db_session.commit()
+    out = await svc.send_approved_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: calls.append(a))
+    assert out["skipped"] == "not_active" and calls == []
+
+
+@pytest.mark.asyncio
+async def test_approving_dispatches_the_send_instead_of_waiting_for_the_tick(client, db_session, monkeypatch):
+    from app.tasks import campaigns as campaign_tasks
+
+    c = await _campaign(db_session, review_before_send=True)
+    ct = await _contact(db_session, "lead@acme.com", verified=True)
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=ct.email,
+                         status="draft_created", email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    dispatched = []
+    monkeypatch.setattr(campaign_tasks.send_approved_now, "delay", lambda *a: dispatched.append(a))
+    monkeypatch.setattr(svc, "window_open", lambda campaign, now=None: True)
+
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/approve")
+    assert r.status_code == 200
+    assert r.json()["instant_send"] == "dispatched"
+    assert dispatched == [(str(c.org_id), str(c.id))]
+
+
+@pytest.mark.asyncio
+async def test_approving_outside_the_window_says_so_and_dispatches_nothing(client, db_session, monkeypatch):
+    from app.tasks import campaigns as campaign_tasks
+
+    c = await _campaign(db_session, review_before_send=True)
+    p = CampaignProspect(campaign_id=c.id, to_email="x@acme.com", status="draft_created",
+                         email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    dispatched = []
+    monkeypatch.setattr(campaign_tasks.send_approved_now, "delay", lambda *a: dispatched.append(a))
+    monkeypatch.setattr(svc, "window_open", lambda campaign, now=None: False)
+
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/approve")
+    assert r.json()["instant_send"] == "window_closed"
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_campaign_sends_what_was_approved_while_paused(client, db_session, monkeypatch):
+    from app.tasks import campaigns as campaign_tasks
+
+    c = await _campaign(db_session, status="paused")
+    dispatched = []
+    monkeypatch.setattr(campaign_tasks.send_approved_now, "delay", lambda *a: dispatched.append(a))
+    monkeypatch.setattr(svc, "window_open", lambda campaign, now=None: True)
+
+    r = await client.patch(f"/api/v1/campaigns/{c.id}", json={"status": "active"})
+    assert r.status_code == 200
+    assert dispatched == [(str(c.org_id), str(c.id))]
+    # Pausing doesn't.
+    await client.patch(f"/api/v1/campaigns/{c.id}", json={"status": "paused"})
+    assert len(dispatched) == 1

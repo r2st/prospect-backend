@@ -1323,6 +1323,42 @@ async def run_campaign_now(
         return {"campaign_id": str(campaign_id), "error": str(exc)}
 
 
+async def send_approved_now(
+    db: AsyncSession, campaign_id: uuid.UUID, *, now: Optional[datetime] = None, schedule: ScheduleFn
+) -> dict:
+    """Put this campaign's approved emails on the wire now, not at the next tick.
+
+    Dispatched when an operator approves a draft or resumes a campaign, so an
+    approval doesn't sit for up to 15 minutes. Deliberately only the tail of
+    the tick: verification (an approved address Hunter hasn't seen would
+    otherwise be held) and ``schedule_sends``. No discovery and no drafting —
+    those spend AI and Hunter budget and belong to the beat.
+
+    Every gate still applies, because it is the same ``schedule_sends``: the
+    window, the warm-up cap, verified-only, and the 120–300s gap between sends
+    (``next_send_at``). So the first approval goes out now and a burst of
+    approvals is paced, not blasted. The ``scheduled_for`` lease keeps this and
+    a concurrent tick from scheduling the same row twice, and the claim in
+    ``send_prospect`` makes a duplicate task harmless anyway. Whatever this
+    can't schedule — window shut, cap spent, past the horizon — the tick still
+    picks up.
+    """
+    now = _aware(now)
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None or campaign.status != "active" or campaign.deleted_at is not None:
+        return {"campaign_id": str(campaign_id), "skipped": "not_active"}
+    try:
+        verification = await verify_prospects(db, campaign)
+        await db.commit()
+        scheduled = await schedule_sends(db, campaign, now, schedule=schedule)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Campaign %s instant send failed", campaign_id)
+        await db.rollback()
+        return {"campaign_id": str(campaign_id), "error": str(exc)}
+    return {"campaign_id": str(campaign_id), "verification": verification, "scheduled": scheduled}
+
+
 async def run_campaigns_tick(
     db: AsyncSession, *, now: Optional[datetime] = None, schedule: ScheduleFn
 ) -> list[dict]:

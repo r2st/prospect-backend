@@ -5,6 +5,9 @@
   and scheduling this tick's sends.
 * ``run_campaign_now`` — the same tick for one campaign, dispatched by
   ``POST /campaigns`` so a new campaign starts searching immediately.
+* ``send_approved_now`` — just verification and scheduling for one campaign,
+  dispatched on approve and on resume so an approved email doesn't wait for
+  the next tick.
 * ``send_campaign_prospect`` — one send, dispatched by the scheduler with a
   countdown so consecutive sends are 120–300s apart. Bound to the prospect's
   org with ``org_scope``; the claim inside ``send_prospect`` makes a duplicate
@@ -62,6 +65,22 @@ def run_campaign_now(org_id: str, campaign_id: str):
         async with org_scope(uuid.UUID(org_id)):
             async with celery_session() as db:
                 return await run_now(db, uuid.UUID(campaign_id), schedule=_schedule)
+
+    return _run_async(_run())
+
+
+@celery_app.task(name="app.tasks.campaigns.send_approved_now")
+def send_approved_now(org_id: str, campaign_id: str):
+    """Schedule one campaign's approved emails now — dispatched on approve/resume."""
+
+    async def _run():
+        from app.database_celery import celery_session
+        from app.org_context import org_scope
+        from app.services.campaigns import send_approved_now as send_now
+
+        async with org_scope(uuid.UUID(org_id)):
+            async with celery_session() as db:
+                return await send_now(db, uuid.UUID(campaign_id), schedule=_schedule)
 
     return _run_async(_run())
 
