@@ -429,30 +429,136 @@ def guess_email(first_name: Optional[str], domain: Optional[str]) -> Optional[st
     return f"{local}@{d}"
 
 
-async def _fill_guessed_emails(db: AsyncSession, company_ids: list[uuid.UUID]) -> int:
-    """Give named, address-less contacts at these companies a ``firstname@domain`` guess."""
-    rows = (
+# A prospect is only ever scheduled once its contact's address carries this
+# verdict. Pattern guesses and finder results alike start unverified.
+VERIFIED = "deliverable"
+VERIFY_PER_TICK = 5
+
+
+def _stamp_origin(contact: Contact, origin: str) -> None:
+    meta = dict(contact.email_verification_meta or {})
+    meta["email_origin"] = origin
+    contact.email_verification_meta = meta
+
+
+async def _resolve_missing_emails(db: AsyncSession, company_ids: list[uuid.UUID]) -> dict[str, int]:
+    """Give one named contact per address-less company an address, then verify it.
+
+    Discovery LLMs name people reliably and their addresses almost never. Order:
+    Hunter's Email Finder (the address the person actually uses), falling back
+    to a ``firstname@domain`` guess; either way Hunter's verifier then decides
+    whether it is sendable. Only one contact per company is tried, because only
+    one per company is ever queued and the free Hunter tier is 25 finds a month.
+    Every Hunter call fails open: no key, no budget or an outage leaves the
+    address unverified, which ``schedule_sends`` will not send.
+    """
+    from app.services import hunter_verification
+
+    stats = {"found": 0, "guessed": 0, "verified": 0}
+    companies = (
         await db.execute(
-            select(Contact, Company.domain)
-            .join(Company, Company.id == Contact.company_id)
-            .where(
-                Contact.company_id.in_(company_ids),
-                or_(Contact.email.is_(None), Contact.email == ""),
-                Contact.first_name.isnot(None),
-                Company.domain.isnot(None),
-            )
+            select(Company).where(Company.id.in_(company_ids), Company.domain.isnot(None))
         )
-    ).all()
-    filled = 0
-    for contact, domain in rows:
-        guess = guess_email(contact.first_name, domain)
-        if guess:
+    ).scalars().all()
+    if not companies:
+        return stats
+    has_email = set(
+        (
+            await db.execute(
+                select(Contact.company_id).where(
+                    Contact.company_id.in_([c.id for c in companies]),
+                    Contact.email.isnot(None), Contact.email != "",
+                )
+            )
+        ).scalars().all()
+    )
+    targets: list[tuple[Company, Contact]] = []
+    for company in companies:
+        if company.id in has_email:
+            continue
+        contact = (
+            await db.execute(
+                select(Contact)
+                .where(Contact.company_id == company.id, Contact.first_name.isnot(None))
+                .order_by(Contact.created_at, Contact.id)
+                .limit(1)
+            )
+        ).scalars().first()
+        if contact is not None:
+            targets.append((company, contact))
+    if not targets:
+        return stats
+
+    hunter = hunter_verification.get_hunter_service()
+    budget = await hunter.make_budget(db) if hunter.enabled else None
+    for company, contact in targets:
+        email, origin = None, "pattern"
+        if hunter.enabled:
+            email = await hunter.find_email(
+                db, company, contact.first_name, contact.last_name, budget=budget
+            )
+        if email:
+            origin = "hunter_finder"
+            contact.email = email.strip().lower()
+            stats["found"] += 1
+        else:
+            guess = guess_email(contact.first_name, company.domain)
+            if not guess:
+                continue
             contact.email = guess
-            filled += 1
-    if filled:
+            stats["guessed"] += 1
+        if hunter.enabled:
+            verdict = await hunter.verify_contact(db, contact, budget=budget)
+            if verdict.get("result") == VERIFIED:
+                stats["verified"] += 1
+        # After verifying: a verdict replaces the meta wholesale.
+        _stamp_origin(contact, origin)
+    await db.flush()
+    logger.info("Campaign discovery emails: %s", stats)
+    return stats
+
+
+async def _record_emailless(
+    db: AsyncSession, campaign: Campaign, company_ids: list[uuid.UUID], *, source: str
+) -> int:
+    """Keep a ``no_email`` row per discovered company we could not address.
+
+    So the dashboard shows what discovery found, not just what it could mail.
+    Never sent, never drafted (it is outside ``PENDING``), and replaced by a
+    real prospect the day an address turns up.
+    """
+    if not company_ids:
+        return 0
+    known = set(
+        (
+            await db.execute(
+                select(CampaignProspect.company_id).where(
+                    CampaignProspect.campaign_id == campaign.id,
+                    CampaignProspect.company_id.in_(company_ids),
+                )
+            )
+        ).scalars().all()
+    )
+    added = 0
+    for cid in company_ids:
+        if cid in known:
+            continue
+        contact = (
+            await db.execute(
+                select(Contact).where(Contact.company_id == cid)
+                .order_by(Contact.created_at, Contact.id).limit(1)
+            )
+        ).scalars().first()
+        db.add(CampaignProspect(
+            campaign_id=campaign.id, company_id=cid,
+            contact_id=contact.id if contact else None,
+            to_email=None, status="no_email", source=source,
+            skip_reason="No email address found for this company yet",
+        ))
+        added += 1
+    if added:
         await db.flush()
-        logger.info("Campaign discovery: guessed %d email(s) as firstname@domain", filled)
-    return filled
+    return added
 
 
 async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
@@ -475,11 +581,12 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     company_ids = [o.company_id for o in result.outcomes if o.company_id]
     if not company_ids:
         return 0
-    await _fill_guessed_emails(db, company_ids)
+    company_ids = list(dict.fromkeys(company_ids))
+    await _resolve_missing_emails(db, company_ids)
     rows = (
         await db.execute(
             select(Contact)
-            .where(Contact.company_id.in_(company_ids), Contact.email.isnot(None))
+            .where(Contact.company_id.in_(company_ids), Contact.email.isnot(None), Contact.email != "")
             .order_by(Contact.created_at, Contact.id)
         )
     ).scalars().all()
@@ -488,7 +595,24 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     first: dict[uuid.UUID, Contact] = {}
     for c in rows:
         first.setdefault(c.company_id, c)
-    return await queue_contacts(db, campaign, list(first.values()), source=found.provider)
+    # A company recorded as email-less on an earlier day now has an address:
+    # drop the placeholder so the real prospect can take its place.
+    for stale in (
+        await db.execute(
+            select(CampaignProspect).where(
+                CampaignProspect.campaign_id == campaign.id,
+                CampaignProspect.status == "no_email",
+                CampaignProspect.company_id.in_(list(first)),
+            )
+        )
+    ).scalars().all():
+        await db.delete(stale)
+    await db.flush()
+    queued = await queue_contacts(db, campaign, list(first.values()), source=found.provider)
+    await _record_emailless(
+        db, campaign, [cid for cid in company_ids if cid not in first], source=found.provider
+    )
+    return queued
 
 
 async def discover_prospects(
@@ -757,6 +881,62 @@ async def sending_account(db: AsyncSession, campaign: Campaign) -> Optional[Gmai
     return acct
 
 
+async def verify_prospects(db: AsyncSession, campaign: Campaign) -> dict[str, int]:
+    """Verify this campaign's pending prospects ahead of the platform-wide sweep.
+
+    ``verify_pending_contacts`` would get to them eventually, oldest contact
+    first across every org; a campaign waiting behind that backlog sends
+    nothing. Then retire prospects whose verdict is in and isn't deliverable:
+    they can never be scheduled, and left pending they'd hold the discovery
+    gate shut (``_pending_count``).
+    """
+    from app.services import hunter_verification
+
+    out = {"verified": 0, "rejected": 0}
+    hunter = hunter_verification.get_hunter_service()
+    if hunter.enabled:
+        pairs = (
+            await db.execute(
+                select(CampaignProspect, Contact)
+                .join(Contact, Contact.id == CampaignProspect.contact_id)
+                .where(
+                    CampaignProspect.campaign_id == campaign.id,
+                    CampaignProspect.status.in_(PENDING),
+                    Contact.email_verified_at.is_(None),
+                )
+                .order_by(CampaignProspect.created_at, CampaignProspect.id)
+                .limit(VERIFY_PER_TICK)
+            )
+        ).all()
+        if pairs:
+            budget = await hunter.make_budget(db)
+            for _, contact in pairs:
+                origin = (contact.email_verification_meta or {}).get("email_origin")
+                await hunter.verify_contact(db, contact, budget=budget)
+                if origin:
+                    _stamp_origin(contact, origin)
+                out["verified"] += 1
+    rejected = (
+        await db.execute(
+            select(CampaignProspect, Contact.email_verification_result)
+            .join(Contact, Contact.id == CampaignProspect.contact_id)
+            .where(
+                CampaignProspect.campaign_id == campaign.id,
+                CampaignProspect.status.in_(PENDING),
+                Contact.email_verified_at.isnot(None),
+                or_(Contact.email_verification_result.is_(None),
+                    Contact.email_verification_result != VERIFIED),
+            )
+        )
+    ).all()
+    for p, result in rejected:
+        p.status = "skipped"
+        p.skip_reason = f"Email not verified deliverable (verification: {result or 'none'})"
+        out["rejected"] += 1
+    await db.flush()
+    return out
+
+
 async def schedule_sends(
     db: AsyncSession, campaign: Campaign, now: Optional[datetime] = None, *, schedule: ScheduleFn
 ) -> int:
@@ -795,12 +975,28 @@ async def schedule_sends(
         logger.info("schedule_sends campaign=%s: no quota (ramp_cap=%d sent_today=%d in_flight=%d)",
                     campaign.id, cap, already_sent, in_flight)
         return 0
-    ready = (
+    # Only verified addresses are sent; an unverified one waits for
+    # verify_prospects (or the platform sweep) rather than going on the wire.
+    unverified = (
         await db.execute(
-            select(CampaignProspect)
+            select(func.count(CampaignProspect.id))
+            .outerjoin(Contact, Contact.id == CampaignProspect.contact_id)
             .where(
                 CampaignProspect.campaign_id == campaign.id,
                 CampaignProspect.status == "approved",
+                or_(Contact.id.is_(None), Contact.email_verification_result.is_(None),
+                    Contact.email_verification_result != VERIFIED),
+            )
+        )
+    ).scalar_one()
+    ready = (
+        await db.execute(
+            select(CampaignProspect)
+            .join(Contact, Contact.id == CampaignProspect.contact_id)
+            .where(
+                CampaignProspect.campaign_id == campaign.id,
+                CampaignProspect.status == "approved",
+                Contact.email_verification_result == VERIFIED,
                 or_(CampaignProspect.scheduled_for.is_(None), CampaignProspect.scheduled_for < lease_floor),
             )
             .order_by(CampaignProspect.approved_at, CampaignProspect.id)
@@ -812,8 +1008,8 @@ async def schedule_sends(
     at = max(now, _aware(campaign.next_send_at) if campaign.next_send_at else now)
     logger.info(
         "schedule_sends campaign=%s: window=%s, account=%s, quota=%d, ready=%d, "
-        "now=%s, next_send_at=%s, at=%s, horizon=%s, window_end=%s",
-        campaign.id, is_open, acct is not None, quota, len(ready),
+        "unverified_held=%d, now=%s, next_send_at=%s, at=%s, horizon=%s, window_end=%s",
+        campaign.id, is_open, acct is not None, quota, len(ready), unverified,
         now, campaign.next_send_at, at, horizon, window_end,
     )
     scheduled = 0
@@ -1015,6 +1211,8 @@ async def run_campaign(
     await db.commit()
 
     out["drafted"] = await generate_drafts(db, campaign, now)
+    await db.commit()
+    out["verification"] = await verify_prospects(db, campaign)
     await db.commit()
     out["scheduled"] = await schedule_sends(db, campaign, now, schedule=schedule)
     await db.commit()

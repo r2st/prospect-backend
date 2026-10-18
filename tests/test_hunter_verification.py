@@ -771,3 +771,18 @@ async def test_verification_stats_endpoint(
     assert body["bounces_prevented"] == 1
     assert body["verified_undeliverable_rate"] == 0.5  # 1 of 2 verified
     assert body["hunter_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_background_sweeps_can_be_switched_off(monkeypatch):
+    """A free plan's allowance must not go to the backlog before anything mails it."""
+    from app.config import get_settings
+    from app.tasks import verification
+
+    def _boom(*a, **kw):
+        raise AssertionError("sweep must not touch Hunter when switched off")
+
+    monkeypatch.setattr(get_settings(), "hunter_background_sweeps", False)
+    monkeypatch.setattr(verification, "get_hunter_service", _boom)
+    out = await verification._sweep(_boom, 200, "verify_pending_contacts")
+    assert out == {"status": "skipped", "reason": "sweeps_disabled", "checked": 0}

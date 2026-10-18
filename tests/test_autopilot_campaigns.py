@@ -64,11 +64,14 @@ async def _campaign(db, **kw) -> Campaign:
     return c
 
 
-async def _contact(db, email: str) -> Contact:
+async def _contact(db, email: str, *, verified: bool = False) -> Contact:
     co = Company(name=f"Co {email}", domain=email.split("@")[1], source="manual")
     db.add(co)
     await db.flush()
     ct = Contact(company_id=co.id, first_name="Jane", last_name="Doe", email=email)
+    if verified:
+        ct.email_verification_result = "deliverable"
+        ct.email_verified_at = MIDWEEK
     db.add(ct)
     await db.commit()
     return ct
@@ -216,8 +219,9 @@ async def test_an_address_is_never_queued_twice_across_campaigns(db_session):
 async def test_schedule_spaces_sends_two_to_five_minutes_and_respects_the_ramp(db_session):
     c = await _campaign(db_session)
     for i in range(8):
+        ct = await _contact(db_session, f"p{i}@acme{i}.com", verified=True)
         db_session.add(CampaignProspect(
-            campaign_id=c.id, to_email=f"p{i}@acme.com", status="approved",
+            campaign_id=c.id, contact_id=ct.id, to_email=f"p{i}@acme{i}.com", status="approved",
             email_subject="s", email_body="b", approved_at=MIDWEEK - timedelta(minutes=8 - i),
         ))
     await db_session.commit()
@@ -414,38 +418,168 @@ def test_guess_email_is_firstname_at_domain(first, domain, expected):
     assert svc.guess_email(first, domain) == expected
 
 
-@pytest.mark.asyncio
-async def test_search_fills_missing_emails_so_named_contacts_become_prospects(db_session, monkeypatch):
+class _FakeHunter:
+    """Stands in for HunterVerificationService: canned finder hits and verdicts."""
+
+    def __init__(self, *, enabled=True, finds=None, verdicts=None):
+        self.enabled = enabled
+        self.finds = finds or {}          # domain -> email
+        self.verdicts = verdicts or {}    # email -> result
+        self.find_calls, self.verify_calls = [], []
+
+    async def make_budget(self, db):
+        return None
+
+    async def find_email(self, db, company, first, last, *, budget=None):
+        self.find_calls.append(company.domain)
+        return self.finds.get(company.domain)
+
+    async def verify_contact(self, db, contact, *, budget=None):
+        self.verify_calls.append(contact.email)
+        result = self.verdicts.get(contact.email, "deliverable")
+        contact.email_verification_result = result
+        contact.email_verified_at = MIDWEEK
+        contact.email_verification_meta = {"hunter_result": result}
+        return {"status": "ok", "result": result}
+
+
+async def _run_search(db_session, monkeypatch, hunter, companies):
     from types import SimpleNamespace
 
-    from app.services import gemini_discovery, ingestion
-
-    campaign = await _campaign(db_session)
-    co = Company(name="Guessco", domain="guessco.com", source="manual")
-    nodomain = Company(name="Nodomain Inc", source="manual")
-    db_session.add_all([co, nodomain])
-    await db_session.flush()
-    named = Contact(company_id=co.id, first_name="Priya", last_name="Shah")
-    orphan = Contact(company_id=nodomain.id, first_name="Sam", last_name="Lee")
-    keep = await _contact(db_session, "real@kept.com")
-    db_session.add_all([named, orphan])
-    await db_session.commit()
+    from app.services import gemini_discovery, hunter_verification, ingestion
 
     async def fake_search(*a, **kw):
         return SimpleNamespace(records=[], provider="groq")
 
     class FakeIngest:
         async def ingest(self, db, records):
-            ids = [co.id, nodomain.id, keep.company_id]
-            return SimpleNamespace(outcomes=[SimpleNamespace(company_id=i) for i in ids])
+            return SimpleNamespace(outcomes=[SimpleNamespace(company_id=c.id) for c in companies])
 
     monkeypatch.setattr(gemini_discovery, "search_companies", fake_search)
     monkeypatch.setattr(ingestion, "get_ingestion_service", lambda: FakeIngest())
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: hunter)
+    campaign = await _campaign(db_session)
+    return campaign, await svc._search_companies(db_session, campaign)
 
-    assert await svc._search_companies(db_session, campaign) == 2
-    await db_session.refresh(named)
-    await db_session.refresh(orphan)
+
+async def _named(db, domain, first="Priya", last="Shah"):
+    co = Company(name=f"Co {domain or 'none'}", domain=domain, source="manual")
+    db.add(co)
+    await db.flush()
+    ct = Contact(company_id=co.id, first_name=first, last_name=last)
+    db.add(ct)
+    await db.commit()
+    return co, ct
+
+
+@pytest.mark.asyncio
+async def test_hunter_finder_supplies_the_real_address_then_it_is_verified(db_session, monkeypatch):
+    co, ct = await _named(db_session, "finder.com")
+    hunter = _FakeHunter(finds={"finder.com": "P.Shah@finder.com"})
+    campaign, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 1
+    await db_session.refresh(ct)
+    assert ct.email == "p.shah@finder.com"
+    assert hunter.verify_calls == ["p.shah@finder.com"]
+    assert ct.email_verification_result == "deliverable"
+    assert ct.email_verification_meta["email_origin"] == "hunter_finder"
+
+
+@pytest.mark.asyncio
+async def test_pattern_guess_is_the_fallback_when_the_finder_misses(db_session, monkeypatch):
+    co, ct = await _named(db_session, "guessco.com")
+    hunter = _FakeHunter(verdicts={"priya@guessco.com": "risky"})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 1
+    await db_session.refresh(ct)
+    assert hunter.find_calls == ["guessco.com"]
+    assert ct.email == "priya@guessco.com"
+    assert ct.email_verification_result == "risky"
+    assert ct.email_verification_meta["email_origin"] == "pattern"
+
+
+@pytest.mark.asyncio
+async def test_without_a_hunter_key_the_guess_is_queued_unverified(db_session, monkeypatch):
+    co, ct = await _named(db_session, "nokey.com")
+    keep = await _contact(db_session, "real@kept.com")
+    hunter = _FakeHunter(enabled=False)
+    campaign, queued = await _run_search(
+        db_session, monkeypatch, hunter, [co, await db_session.get(Company, keep.company_id)]
+    )
+    assert queued == 2
+    await db_session.refresh(ct)
     await db_session.refresh(keep)
-    assert named.email == "priya@guessco.com"
-    assert orphan.email is None  # no domain → no guess
+    assert ct.email == "priya@nokey.com" and ct.email_verified_at is None
     assert keep.email == "real@kept.com"  # a real address is never overwritten
+    assert hunter.find_calls == [] and hunter.verify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_company_with_no_address_is_recorded_not_dropped(db_session, monkeypatch):
+    co, ct = await _named(db_session, None)
+    campaign, queued = await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
+    assert queued == 0
+    rows = (await db_session.execute(
+        select(CampaignProspect).where(CampaignProspect.campaign_id == campaign.id)
+    )).scalars().all()
+    assert [(r.status, r.company_id, r.to_email) for r in rows] == [("no_email", co.id, None)]
+    # Not pending: it never reaches drafting and never holds the discovery gate.
+    assert await svc._pending_count(db_session, campaign) == 0
+
+
+@pytest.mark.asyncio
+async def test_unverified_prospects_are_held_and_rejected_ones_retired(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    c = await _campaign(db_session)
+    good = await _contact(db_session, "good@v1.com", verified=True)
+    pending = await _contact(db_session, "pending@v2.com")
+    bad = await _contact(db_session, "bad@v3.com")
+    bad.email_verification_result, bad.email_verified_at = "undeliverable", MIDWEEK
+    for ct in (good, pending, bad):
+        db_session.add(CampaignProspect(
+            campaign_id=c.id, contact_id=ct.id, to_email=ct.email, status="approved",
+            email_subject="s", email_body="b", approved_at=MIDWEEK,
+        ))
+    await db_session.commit()
+
+    # No key: nothing is verified, the bad one is retired, the pending one waits.
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: _FakeHunter(enabled=False))
+    assert await svc.verify_prospects(db_session, c) == {"verified": 0, "rejected": 1}
+    calls = []
+    assert await svc.schedule_sends(db_session, c, MIDWEEK,
+                                    schedule=lambda org, pid, cd: calls.append(pid)) == 1
+    by_contact = {p.contact_id: p for p in (await db_session.execute(
+        select(CampaignProspect).where(CampaignProspect.campaign_id == c.id))).scalars()}
+    assert calls == [by_contact[good.id].id]
+    assert by_contact[pending.id].scheduled_for is None
+    assert by_contact[bad.id].status == "skipped"
+
+    # With a key the held one is verified and becomes sendable.
+    monkeypatch.setattr(hunter_verification, "get_hunter_service", lambda: _FakeHunter())
+    assert (await svc.verify_prospects(db_session, c))["verified"] == 1
+    await db_session.refresh(pending)
+    assert pending.email_verification_result == "deliverable"
+
+
+@pytest.mark.asyncio
+async def test_metrics_report_discovery_queue_and_verification(db_session):
+    from app.routers.campaigns import _metrics
+
+    c = await _campaign(db_session)
+    good = await _contact(db_session, "good@m1.com", verified=True)
+    waiting = await _contact(db_session, "wait@m2.com")
+    co, _ = await _named(db_session, None)
+    db_session.add_all([
+        CampaignProspect(campaign_id=c.id, company_id=good.company_id, contact_id=good.id,
+                         to_email=good.email, status="approved", email_subject="s", email_body="b"),
+        CampaignProspect(campaign_id=c.id, company_id=waiting.company_id, contact_id=waiting.id,
+                         to_email=waiting.email, status="draft_created", email_subject="s", email_body="b"),
+        CampaignProspect(campaign_id=c.id, company_id=co.id, status="no_email"),
+    ])
+    await db_session.commit()
+    m = await _metrics(db_session, c)
+    assert m["companies_discovered"] == 3
+    assert m["companies_without_email"] == 1
+    assert m["queued_to_send"] == 1
+    assert (m["pending_verified"], m["pending_unverified"]) == (1, 1)

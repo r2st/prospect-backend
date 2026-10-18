@@ -52,6 +52,11 @@ def _summarize(results: list[dict]) -> dict:
 
 
 async def _sweep(select_fn, limit: int, label: str) -> dict:
+    from app.config import get_settings
+
+    if not get_settings().hunter_background_sweeps:
+        logger.info("%s: HUNTER_BACKGROUND_SWEEPS is off — skipping", label)
+        return {"status": "skipped", "reason": "sweeps_disabled", "checked": 0}
     service = get_hunter_service()
     if not service.enabled:
         logger.info("%s: no Hunter API key configured — skipping", label)

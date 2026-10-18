@@ -128,6 +128,12 @@ class ProspectOut(BaseModel):
     contact_id: Optional[uuid.UUID] = None
     contact_name: Optional[str] = None
     to_email: Optional[str] = None
+    # Hunter's verdict on the contact's address ("deliverable" is the only one
+    # that is ever sent); None = not verified yet.
+    email_verification: Optional[str] = None
+    email_verified: bool = False
+    # "hunter_finder" | "pattern" for addresses discovery supplied; None otherwise.
+    email_origin: Optional[str] = None
     status: str
     source: Optional[str] = None
     skip_reason: Optional[str] = None
@@ -250,11 +256,37 @@ async def _metrics(db: AsyncSession, c: Campaign) -> dict:
     ).all()
     by_status = {s: n for s, n in rows}
     mailed = sum(by_status.get(s, 0) for s in svc.WIRE)
+    companies_discovered = (
+        await db.execute(
+            select(func.count(func.distinct(CampaignProspect.company_id))).where(
+                CampaignProspect.campaign_id == c.id, CampaignProspect.company_id.isnot(None)
+            )
+        )
+    ).scalar_one()
+    # Of the prospects still in the pipeline: verified (sendable) vs not yet
+    # checked. Checked-and-not-deliverable ones are retired by verify_prospects.
+    verified_pending = unverified_pending = 0
+    for result, checked, n in (
+        await db.execute(
+            select(
+                Contact.email_verification_result,
+                Contact.email_verified_at.isnot(None),
+                func.count(CampaignProspect.id),
+            )
+            .join(Contact, Contact.id == CampaignProspect.contact_id)
+            .where(CampaignProspect.campaign_id == c.id, CampaignProspect.status.in_(svc.PENDING))
+            .group_by(Contact.email_verification_result, Contact.email_verified_at.isnot(None))
+        )
+    ).all():
+        if result == svc.VERIFIED:
+            verified_pending += n
+        elif not checked:
+            unverified_pending += n
     replied = by_status.get("replied", 0)
     bounced = by_status.get("bounced", 0)
     return {
         "by_status": by_status,
-        "total_prospects": sum(by_status.values()),
+        "total_prospects": sum(n for s, n in by_status.items() if s != "no_email"),
         "emails_sent": mailed,
         "replies": replied,
         "bounces": bounced,
@@ -263,6 +295,12 @@ async def _metrics(db: AsyncSession, c: Campaign) -> dict:
         "sent_today": await svc.sent_today(db, c),
         "todays_cap": svc.ramp_cap(c),
         "awaiting_review": by_status.get("draft_created", 0),
+        "companies_discovered": companies_discovered,
+        "companies_without_email": by_status.get("no_email", 0),
+        # Drafted and approved, waiting for a send slot.
+        "queued_to_send": by_status.get("approved", 0),
+        "pending_verified": verified_pending,
+        "pending_unverified": unverified_pending,
     }
 
 
@@ -501,21 +539,30 @@ async def list_prospects(
             await db.execute(select(Company.id, Company.name).where(Company.id.in_(company_ids)))
         ).all()
     } if company_ids else {}
-    contacts = {
-        cid: " ".join(x for x in (first, last) if x) or None
-        for cid, first, last in (
-            await db.execute(
-                select(Contact.id, Contact.first_name, Contact.last_name).where(Contact.id.in_(contact_ids))
-            )
-        ).all()
-    } if contact_ids else {}
+    contact_rows = (
+        await db.execute(
+            select(
+                Contact.id, Contact.first_name, Contact.last_name,
+                Contact.email_verification_result, Contact.email_verification_meta,
+            ).where(Contact.id.in_(contact_ids))
+        )
+    ).all() if contact_ids else []
+    contacts = {r.id: " ".join(x for x in (r.first_name, r.last_name) if x) or None for r in contact_rows}
+    verdicts = {
+        r.id: (r.email_verification_result, (r.email_verification_meta or {}).get("email_origin"))
+        for r in contact_rows
+    }
 
     items = [
         ProspectOut(
             id=p.id, campaign_id=p.campaign_id,
             company_id=p.company_id, company_name=companies.get(p.company_id),
             contact_id=p.contact_id, contact_name=contacts.get(p.contact_id),
-            to_email=p.to_email, status=p.status, source=p.source,
+            to_email=p.to_email,
+            email_verification=verdicts.get(p.contact_id, (None, None))[0],
+            email_verified=verdicts.get(p.contact_id, (None, None))[0] == svc.VERIFIED,
+            email_origin=verdicts.get(p.contact_id, (None, None))[1],
+            status=p.status, source=p.source,
             skip_reason=p.skip_reason, error=p.error,
             email_subject=p.email_subject, email_body=p.email_body,
             gmail_message_id=p.gmail_message_id,

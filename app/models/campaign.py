@@ -51,6 +51,8 @@ PROSPECT_STATUSES = (
     "bounced",
     "skipped",
     "failed",
+    # Discovered, but no address could be found or guessed. Never drafted or sent.
+    "no_email",
 )
 # Statuses that mean "this address has been (or is being) mailed by a
 # campaign". The partial unique index below makes "never the same address
