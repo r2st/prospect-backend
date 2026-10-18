@@ -640,6 +640,47 @@ async def test_a_rejected_address_is_never_drafted(db_session, monkeypatch):
     assert drafted_for == []
 
 
+async def _drafting(db_session, monkeypatch, *, hunter_enabled):
+    """A campaign with one verified and one not-yet-verified queued prospect."""
+    from app.services import hunter_verification, org_gemini
+
+    c = await _campaign(db_session)
+    ok = await _contact(db_session, "ok@verified.com", verified=True)
+    pending = await _contact(db_session, "guess@unchecked.com")
+    for ct in (pending, ok):  # the unverified one is older, so it would be picked first
+        db_session.add(CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=ct.email, status="queued"))
+        await db_session.commit()
+    monkeypatch.setattr(hunter_verification, "get_hunter_service",
+                        lambda: _FakeHunter(enabled=hunter_enabled))
+    prompted = []
+
+    async def fake_json(db, org_id, *, prompt, schema, **kw):
+        prompted.append(prompt)
+        return schema(subject="Hello", body="A short note.")
+
+    monkeypatch.setattr(org_gemini, "generate_json", fake_json)
+    drafted = await svc.generate_drafts(db_session, c, MIDWEEK)
+    rows = (await db_session.execute(select(CampaignProspect).where(
+        CampaignProspect.campaign_id == c.id))).scalars().all()
+    return drafted, {p.to_email: p.status for p in rows}
+
+
+@pytest.mark.asyncio
+async def test_with_hunter_on_only_verified_prospects_are_drafted(db_session, monkeypatch):
+    """Verify and draft each take a few rows per tick and pick different ones, so
+    ordering alone let the E2E campaign draft guesses Hunter later rejected."""
+    drafted, statuses = await _drafting(db_session, monkeypatch, hunter_enabled=True)
+    assert drafted == 1
+    assert statuses == {"ok@verified.com": "approved", "guess@unchecked.com": "queued"}
+
+
+@pytest.mark.asyncio
+async def test_without_a_hunter_key_drafting_does_not_wait_for_verification(db_session, monkeypatch):
+    drafted, statuses = await _drafting(db_session, monkeypatch, hunter_enabled=False)
+    assert drafted == 2
+    assert set(statuses.values()) == {"approved"}
+
+
 @pytest.mark.asyncio
 async def test_run_campaign_now_runs_one_active_campaign(db_session, monkeypatch):
     c = await _campaign(db_session)

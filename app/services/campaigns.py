@@ -774,13 +774,28 @@ async def _sender_identity(db: AsyncSession, campaign: Campaign) -> tuple[str, s
 async def generate_drafts(
     db: AsyncSession, campaign: Campaign, now: Optional[datetime] = None, *, limit: int = DRAFTS_PER_TICK
 ) -> int:
-    """Draft emails for queued prospects. Stops at the first LLM failure (logged)."""
+    """Draft emails for queued prospects. Stops at the first LLM failure (logged).
+
+    With Hunter configured, only prospects whose address verified deliverable
+    are drafted. Ordering verify_prospects ahead of this is not enough on its
+    own: each takes a few rows per tick and they select different rows, so the
+    first E2E campaign drafted five guessed addresses in the same tick that
+    Hunter rejected four others — an AI draft per address that can never send.
+    Without a key nothing is ever verified, so drafts are written as before and
+    wait for one.
+    """
+    from app.services import hunter_verification
+
+    stmt = select(CampaignProspect).where(
+        CampaignProspect.campaign_id == campaign.id, CampaignProspect.status == "queued"
+    )
+    if hunter_verification.get_hunter_service().enabled:
+        stmt = stmt.join(Contact, Contact.id == CampaignProspect.contact_id).where(
+            Contact.email_verification_result == VERIFIED
+        )
     queued = (
         await db.execute(
-            select(CampaignProspect)
-            .where(CampaignProspect.campaign_id == campaign.id, CampaignProspect.status == "queued")
-            .order_by(CampaignProspect.created_at, CampaignProspect.id)
-            .limit(limit)
+            stmt.order_by(CampaignProspect.created_at, CampaignProspect.id).limit(limit)
         )
     ).scalars().all()
     if not queued:
