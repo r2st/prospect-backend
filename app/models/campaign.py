@@ -149,6 +149,11 @@ class CampaignProspect(Base, OrgScopedMixin):
     error: Mapped[Optional[str]] = mapped_column(Text)
     email_subject: Mapped[Optional[str]] = mapped_column(String(500))
     email_body: Mapped[Optional[str]] = mapped_column(Text)
+    # The template this draft was written from (migration 127); None = the AI
+    # wrote it freely. Can differ from the campaign's when switched per draft.
+    template_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("email_templates.id", ondelete="SET NULL")
+    )
     email_send_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("email_sends.id", ondelete="SET NULL")
     )

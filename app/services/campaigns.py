@@ -508,6 +508,7 @@ def reset_for_redraft(p: CampaignProspect) -> None:
     """Back to ``queued`` with no draft: the next pass verifies and drafts it again."""
     p.status = "queued"
     p.email_subject = p.email_body = None
+    p.template_id = None
     p.approved_at = p.scheduled_for = None
     p.skip_reason = p.error = None
 
@@ -1310,28 +1311,20 @@ async def generate_drafts(
         if contact is None or not contact.email:
             p.status, p.skip_reason = "skipped", "Contact no longer has an email address"
             continue
-        if template is not None and campaign.template_mode == "template":
-            # The operator's own wording: filled in, not rewritten. No AI call.
-            subject, body = render_template_draft(template, contact, company)
-            subject, body = " ".join(subject.split())[:150], body[:4000]
-        else:
-            try:
-                draft = await org_gemini.generate_json(
-                    db, campaign.org_id, system=DRAFT_SYSTEM,
-                    prompt=draft_prompt(campaign, contact, company, sender_name, sender_org,
-                                        template=template),
-                    schema=DraftEmail, max_tokens=2048, temperature=0.6,
-                )
-            except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
-                msg = str(exc) or "No AI key is saved in Settings → API Keys"
-                await log_error(db, campaign, f"Drafting stopped: {msg}", now)
-                break
-            subject = " ".join(draft.subject.split())[:150]
-            body = draft.body.strip()[:4000]
+        try:
+            subject, body = await write_draft(
+                db, campaign, contact, company, template, campaign.template_mode,
+                sender_name, sender_org,
+            )
+        except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
+            msg = str(exc) or "No AI key is saved in Settings → API Keys"
+            await log_error(db, campaign, f"Drafting stopped: {msg}", now)
+            break
         if not subject or not body:
             await log_error(db, campaign, f"Empty draft for {p.to_email}; will retry", now)
             continue
         p.email_subject, p.email_body = subject, body
+        p.template_id = template.id if template is not None else None
         # A leftover "[Company Name]" must never go out on autopilot.
         needs_review = campaign.review_before_send or bool(_PLACEHOLDER.search(subject + body))
         if needs_review:
@@ -1341,6 +1334,53 @@ async def generate_drafts(
         drafted += 1
     await db.flush()
     return drafted
+
+
+async def write_draft(
+    db: AsyncSession, campaign: Campaign, contact: Optional[Contact], company: Optional[Company],
+    template: Optional[EmailTemplate], mode: str, sender_name: str, sender_org: str,
+) -> tuple[str, str]:
+    """``(subject, body)`` for one prospect, from ``template`` used per ``mode``.
+
+    ``template`` mode fills the merge fields with no AI call; otherwise the AI
+    writes it, personalising ``template`` when one is given. Raises the
+    org_gemini errors for the caller to report.
+    """
+    if template is not None and mode == "template":
+        # The operator's own wording: filled in, not rewritten. No AI call.
+        subject, body = render_template_draft(template, contact, company)
+        return " ".join(subject.split())[:150], body[:4000]
+    draft = await org_gemini.generate_json(
+        db, campaign.org_id, system=DRAFT_SYSTEM,
+        prompt=draft_prompt(campaign, contact, company, sender_name, sender_org,
+                            template=template if mode != "ai" else None),
+        schema=DraftEmail, max_tokens=2048, temperature=0.6,
+    )
+    return " ".join(draft.subject.split())[:150], draft.body.strip()[:4000]
+
+
+async def redraft_prospect(
+    db: AsyncSession, campaign: Campaign, p: CampaignProspect,
+    template: Optional[EmailTemplate], mode: str,
+) -> None:
+    """Rewrite one unsent draft now, from ``template`` (None = the AI writes it).
+
+    For switching templates on a single draft from its preview; the campaign's
+    own template is untouched. The draft stays in review, whatever it was.
+    """
+    contact = await db.get(Contact, p.contact_id) if p.contact_id else None
+    company = await db.get(Company, p.company_id) if p.company_id else None
+    sender_name, sender_org = await _sender_identity(db, campaign)
+    subject, body = await write_draft(
+        db, campaign, contact, company, template, mode if template is not None else "ai",
+        sender_name, sender_org,
+    )
+    if not subject or not body:
+        raise ValueError("The draft came back empty.")
+    p.email_subject, p.email_body = subject, body
+    p.template_id = template.id if template is not None else None
+    p.status, p.approved_at, p.scheduled_for, p.error = "draft_created", None, None, None
+    await db.flush()
 
 
 # ---------------------------------------------------------------------------

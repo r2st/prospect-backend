@@ -354,3 +354,92 @@ async def test_a_word_attachment_downloads_rather_than_renders(client, db_sessio
     c = await _campaign(db_session, document_ids=[str(doc.id)], attach_documents=True)
     r = await client.get(f"/api/v1/campaigns/{c.id}/attachments/file", params={"name": "brief.docx"})
     assert r.status_code == 200 and r.headers["content-disposition"].startswith("attachment;")
+
+
+# ── switching templates on one draft ─────────────────────────────────────────
+# The draft preview couldn't switch templates, didn't say which template a
+# draft came from, and so never showed that template's merge fields.
+
+@pytest.mark.asyncio
+async def test_drafting_from_a_template_records_it_on_the_draft(db_session):
+    t = await _template(db_session)
+    c = await _campaign(db_session, template_id=t.id, template_mode="template")
+    p = await _prospect(db_session, c)
+    await svc.generate_drafts(db_session, c, MIDWEEK)
+    await db_session.refresh(p)
+    assert p.template_id == t.id
+    svc.reset_for_redraft(p)
+    assert p.template_id is None
+
+
+@pytest.mark.asyncio
+async def test_one_draft_can_switch_to_another_template(client, db_session, monkeypatch):
+    first = await _template(db_session)
+    other = await _template(db_session, name="Follow-up", subject="Still on {{company}}'s radar?",
+                            body="<p>Hi {{first_name}}, following up.</p>")
+    c = await _campaign(db_session, template_id=first.id, template_mode="template")
+    p = await _prospect(db_session, c, status="approved", email_subject="Old", email_body="Old",
+                        template_id=first.id, approved_at=MIDWEEK)
+
+    async def no_ai(*a, **kw):
+        raise AssertionError("template mode must not call the AI")
+
+    monkeypatch.setattr(org_gemini, "generate_json", no_ai)
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/redraft",
+                          json={"template_id": str(other.id), "template_mode": "template"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["email_subject"] == "Still on Gart Solutions's radar?"
+    assert body["email_body"] == "Hi Fedir, following up."
+    assert body["template_id"] == str(other.id) and body["template_name"] == "Follow-up"
+    # New copy goes back to review; the campaign keeps its own template.
+    assert body["status"] == "draft_created"
+    await db_session.refresh(c)
+    assert c.template_id == first.id
+
+    listed = (await client.get(f"/api/v1/campaigns/{c.id}/prospects")).json()["items"][0]
+    assert listed["template_id"] == str(other.id) and listed["template_name"] == "Follow-up"
+
+
+@pytest.mark.asyncio
+async def test_a_draft_can_go_back_to_the_ai(client, db_session, monkeypatch):
+    t = await _template(db_session)
+    c = await _campaign(db_session)
+    p = await _prospect(db_session, c, status="draft_created", email_subject="S", email_body="B",
+                        template_id=t.id)
+    prompts = []
+
+    async def fake_json(db, org_id, *, prompt, schema, **kw):
+        prompts.append(prompt)
+        return schema(subject="AI subject", body="AI body")
+
+    monkeypatch.setattr(org_gemini, "generate_json", fake_json)
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/redraft", json={"template_id": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["email_subject"] == "AI subject" and r.json()["template_id"] is None
+    assert "Base the email on this template" not in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_redrafting_one_refuses_sent_mail_and_unknown_templates(client, db_session):
+    t = await _template(db_session)
+    c = await _campaign(db_session)
+    sent = await _prospect(db_session, c, status="sent", email_subject="S", email_body="B")
+    draft = await _prospect(db_session, c, status="draft_created", email_subject="S", email_body="B",
+                            first="Ana", domain="other.com", company="Other")
+    url = f"/api/v1/campaigns/{c.id}/prospects"
+    assert (await client.post(f"{url}/{sent.id}/redraft", json={"template_id": str(t.id)})).status_code == 409
+    r = await client.post(f"{url}/{draft.id}/redraft", json={"template_id": str(uuid.uuid4())})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_draft_saved_as_a_template_is_linked_to_it(client, db_session):
+    c = await _campaign(db_session)
+    p = await _prospect(db_session, c, status="draft_created", email_subject="Hi Fedir", email_body="Hello Fedir")
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/save-template", json={"name": "Mine"})
+    assert r.status_code == 201
+    await db_session.refresh(p)
+    assert str(p.template_id) == r.json()["id"]
+    listed = (await client.get("/api/v1/email-templates")).json()
+    assert any(t["id"] == r.json()["id"] and "{{first_name}}" in t["body"] for t in listed)

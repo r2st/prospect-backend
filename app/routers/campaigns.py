@@ -154,6 +154,9 @@ class ProspectOut(BaseModel):
     error: Optional[str] = None
     email_subject: Optional[str] = None
     email_body: Optional[str] = None
+    # The email template this draft was written from; None = the AI wrote it.
+    template_id: Optional[uuid.UUID] = None
+    template_name: Optional[str] = None
     gmail_message_id: Optional[str] = None
     company_domain: Optional[str] = None
     contact_first_name: Optional[str] = None
@@ -709,6 +712,16 @@ async def delete_campaign(
     await db.commit()
 
 
+async def _template_names(db: AsyncSession, ids: set) -> dict:
+    from app.models.email_template import EmailTemplate
+
+    if not ids:
+        return {}
+    return dict((await db.execute(
+        select(EmailTemplate.id, EmailTemplate.name).where(EmailTemplate.id.in_(ids))
+    )).all())
+
+
 @router.get("/{campaign_id}/prospects")
 async def list_prospects(
     campaign_id: uuid.UUID,
@@ -761,6 +774,7 @@ async def list_prospects(
     sent_from = dict(
         (await db.execute(select(EmailSend.id, EmailSend.from_email).where(EmailSend.id.in_(send_ids)))).all()
     ) if send_ids else {}
+    template_names = await _template_names(db, {p.template_id for p in rows if p.template_id})
 
     items = [
         ProspectOut(
@@ -778,6 +792,7 @@ async def list_prospects(
             status=p.status, source=p.source,
             skip_reason=p.skip_reason, error=p.error,
             email_subject=p.email_subject, email_body=p.email_body,
+            template_id=p.template_id, template_name=template_names.get(p.template_id),
             gmail_message_id=p.gmail_message_id,
             sent_from=sent_from.get(p.email_send_id),
             sent_at=p.sent_at, replied_at=p.replied_at, bounced_at=p.bounced_at,
@@ -962,6 +977,8 @@ async def save_draft_as_template(
     )
     db.add(t)
     await db.flush()
+    # The draft and its new template are one and the same from here on.
+    p.template_id = t.id
     if payload.use_for_campaign:
         c.template_id, c.template_mode = t.id, payload.use_for_campaign
     await db.commit()
@@ -1021,6 +1038,51 @@ async def redraft_campaign(
     count = await svc.redraft(db, c)
     await db.commit()
     return {"redrafting": count, "processing": _dispatch_processing(c) if count else "nothing_queued"}
+
+
+class ProspectRedraftIn(BaseModel):
+    # None = the AI writes it freely; otherwise this template, used per template_mode.
+    template_id: Optional[uuid.UUID] = None
+    template_mode: Literal["template", "ai_template"] = "template"
+
+
+@router.post("/{campaign_id}/prospects/{prospect_id}/redraft", response_model=ProspectOut)
+async def redraft_one_prospect(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: ProspectRedraftIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Rewrite one draft now from another email template (or by the AI).
+
+    Switching templates from the draft preview: only this draft changes, the
+    campaign keeps its own template, and the draft goes back to review even if
+    it had been approved — it is new copy nobody has signed off on.
+    """
+    from app.models.email_template import EmailTemplate
+
+    c = await _get_campaign(db, campaign_id, user)
+    p = await _get_prospect(db, c, prospect_id)
+    if p.status not in ("draft_created", "approved"):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Can't re-draft a prospect that is '{p.status}'.")
+    template = None
+    if payload.template_id is not None:
+        template = await db.get(EmailTemplate, payload.template_id)  # org-scoped
+        if template is None or template.is_archived:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "That email template wasn't found.")
+    try:
+        await svc.redraft_prospect(db, c, p, template, payload.template_mode)
+    except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            str(exc) or "No AI key is saved in Settings → API Keys") from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await db.commit()
+    await db.refresh(p)
+    out = ProspectOut.model_validate(p, from_attributes=True)
+    out.template_name = template.name if template is not None else None
+    return out
 
 
 class ProspectContactIn(BaseModel):
