@@ -1210,13 +1210,36 @@ async def run_campaign(
             await log_error(db, campaign, f"Discovery failed: {exc or 'no AI key saved'}", now)
     await db.commit()
 
-    out["drafted"] = await generate_drafts(db, campaign, now)
-    await db.commit()
+    # Verify before drafting: an address Hunter rejects is retired here, so no
+    # AI draft is written for a prospect who can never be sent.
     out["verification"] = await verify_prospects(db, campaign)
+    await db.commit()
+    out["drafted"] = await generate_drafts(db, campaign, now)
     await db.commit()
     out["scheduled"] = await schedule_sends(db, campaign, now, schedule=schedule)
     await db.commit()
     return out
+
+
+async def run_campaign_now(
+    db: AsyncSession, campaign_id: uuid.UUID, *, now: Optional[datetime] = None, schedule: ScheduleFn
+) -> dict:
+    """One campaign's tick, outside the beat — fired when a campaign is created
+    so its first search doesn't wait up to 15 minutes. The next beat tick finds
+    ``last_discovery_on`` already set and does not search again today."""
+    campaign = await db.get(Campaign, campaign_id)
+    if campaign is None or campaign.status != "active" or campaign.deleted_at is not None:
+        return {"campaign_id": str(campaign_id), "skipped": "not_active"}
+    try:
+        return await run_campaign(db, campaign, now, schedule=schedule)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Campaign %s first run failed", campaign_id)
+        await db.rollback()
+        campaign = await db.get(Campaign, campaign_id)
+        if campaign is not None:
+            await log_error(db, campaign, f"Scheduler error: {exc}", now)
+            await db.commit()
+        return {"campaign_id": str(campaign_id), "error": str(exc)}
 
 
 async def run_campaigns_tick(

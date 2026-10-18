@@ -121,12 +121,18 @@ async def test_create_campaign_builds_icp_and_picks_the_callers_mailbox(client, 
     async def fake_icp(db, org_id, docs):
         return svc.Icp(summary="Widgets for factories", target_industries=["Manufacturing"]), "Widgets"
 
+    from app.tasks import campaigns as campaign_tasks
+
+    dispatched = []
     monkeypatch.setattr(svc, "build_icp", fake_icp)
+    monkeypatch.setattr(campaign_tasks.run_campaign_now, "delay", lambda *a: dispatched.append(a))
     resp = await client.post("/api/v1/campaigns", json={
         "name": "Q4 push", "document_ids": [str(doc.id)], "daily_send_limit": 40,
     })
     assert resp.status_code == 201, resp.text
     body = resp.json()
+    # The first search is dispatched now, not left for the next 15-minute tick.
+    assert dispatched == [(str(APPREND_ORG_ID), body["id"])]
     assert body["icp_json"]["target_industries"] == ["Manufacturing"]
     assert body["gmail_account_id"] == str(acct.id)
     assert body["todays_cap"] == 5 and body["status"] == "active"
@@ -583,3 +589,106 @@ async def test_metrics_report_discovery_queue_and_verification(db_session):
     assert m["companies_without_email"] == 1
     assert m["queued_to_send"] == 1
     assert (m["pending_verified"], m["pending_unverified"]) == (1, 1)
+
+
+# ── tick ordering and the first run on create ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verification_runs_before_drafting(db_session, monkeypatch):
+    c = await _campaign(db_session, last_discovery_on=svc.local_today(
+        Campaign(timezone="America/Toronto"), MIDWEEK))
+    order = []
+
+    async def fake_verify(db, campaign):
+        order.append("verify")
+        return {"verified": 0, "rejected": 0}
+
+    async def fake_drafts(db, campaign, now=None):
+        order.append("draft")
+        return 0
+
+    monkeypatch.setattr(svc, "verify_prospects", fake_verify)
+    monkeypatch.setattr(svc, "generate_drafts", fake_drafts)
+    await svc.run_campaign(db_session, c, MIDWEEK, schedule=lambda *a: None)
+    assert order == ["verify", "draft"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_address_is_never_drafted(db_session, monkeypatch):
+    from app.services import hunter_verification
+
+    c = await _campaign(db_session, last_discovery_on=svc.local_today(
+        Campaign(timezone="America/Toronto"), MIDWEEK))
+    bad = await _contact(db_session, "gone@nope.com")
+    db_session.add(CampaignProspect(campaign_id=c.id, contact_id=bad.id, to_email=bad.email, status="queued"))
+    await db_session.commit()
+    monkeypatch.setattr(hunter_verification, "get_hunter_service",
+                        lambda: _FakeHunter(verdicts={"gone@nope.com": "undeliverable"}))
+    drafted_for = []
+
+    async def fake_drafts(db, campaign, now=None):
+        rows = (await db.execute(select(CampaignProspect).where(
+            CampaignProspect.campaign_id == campaign.id, CampaignProspect.status == "queued"))).scalars().all()
+        drafted_for.extend(p.to_email for p in rows)
+        return len(rows)
+
+    monkeypatch.setattr(svc, "generate_drafts", fake_drafts)
+    out = await svc.run_campaign(db_session, c, MIDWEEK, schedule=lambda *a: None)
+    assert out["verification"] == {"verified": 1, "rejected": 1}
+    assert drafted_for == []
+
+
+@pytest.mark.asyncio
+async def test_run_campaign_now_runs_one_active_campaign(db_session, monkeypatch):
+    c = await _campaign(db_session)
+    ran = []
+
+    async def fake_run(db, campaign, now=None, *, schedule):
+        ran.append(campaign.id)
+        return {"campaign_id": str(campaign.id), "discovered": 3}
+
+    monkeypatch.setattr(svc, "run_campaign", fake_run)
+    assert (await svc.run_campaign_now(db_session, c.id, schedule=lambda *a: None))["discovered"] == 3
+    assert ran == [c.id]
+
+    c.status = "paused"
+    await db_session.commit()
+    out = await svc.run_campaign_now(db_session, c.id, schedule=lambda *a: None)
+    assert out["skipped"] == "not_active" and ran == [c.id]
+
+
+@pytest.mark.asyncio
+async def test_run_campaign_now_logs_a_failure_instead_of_raising(db_session, monkeypatch):
+    c = await _campaign(db_session)
+
+    async def boom(db, campaign, now=None, *, schedule):
+        raise RuntimeError("search exploded")
+
+    monkeypatch.setattr(svc, "run_campaign", boom)
+    out = await svc.run_campaign_now(db_session, c.id, now=MIDWEEK, schedule=lambda *a: None)
+    assert out["error"] == "search exploded"
+    log = (await db_session.execute(select(CampaignDailyLog).where(
+        CampaignDailyLog.campaign_id == c.id))).scalars().one()
+    assert "search exploded" in str(log.errors)
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_active_campaign_stops_it_and_keeps_the_sent_record(client, db_session):
+    c = await _campaign(db_session)
+    pending = CampaignProspect(campaign_id=c.id, to_email="later@acme.com", status="approved",
+                               email_subject="s", email_body="b")
+    sent = CampaignProspect(campaign_id=c.id, to_email="done@acme.com", status="sent")
+    db_session.add_all([pending, sent])
+    await db_session.commit()
+
+    assert (await client.delete(f"/api/v1/campaigns/{c.id}")).status_code == 204
+    assert c.id not in [x["id"] for x in (await client.get("/api/v1/campaigns")).json()]
+    await db_session.refresh(c)
+    await db_session.refresh(pending)
+    await db_session.refresh(sent)
+    assert c.status == "stopped" and c.deleted_at is not None
+    assert pending.status == "skipped" and pending.skip_reason == "Campaign deleted"
+    # Kept, so the address is never mailed again by a later campaign.
+    assert sent.status == "sent"
+    assert await svc.run_campaigns_tick(db_session, now=MIDWEEK, schedule=lambda *a: None) == []

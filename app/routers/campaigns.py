@@ -14,6 +14,7 @@ Agents see their own campaigns; managers and admins see every campaign in their
 org. Org isolation itself comes from the read filter (``OrgScopedMixin``).
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
@@ -34,6 +35,7 @@ from app.models.user import User, UserRole, normalize_role
 from app.services import campaigns as svc
 from app.services import org_gemini
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 AI_KEY_REQUIRED = {
@@ -377,6 +379,14 @@ async def create_campaign(
     db.add(c)
     await db.commit()
     await db.refresh(c)
+    # Best-effort: search now rather than at the next 15-minute tick. If the
+    # broker is unreachable the beat picks the campaign up as before.
+    try:
+        from app.tasks.campaigns import run_campaign_now
+
+        run_campaign_now.delay(str(c.org_id), str(c.id))
+    except Exception as exc:  # pragma: no cover - broker-dependent
+        logger.warning("Could not dispatch first run for campaign %s: %s", c.id, exc)
     return _out(c)
 
 

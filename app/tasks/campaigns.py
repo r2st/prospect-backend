@@ -3,6 +3,8 @@
 * ``run_campaign_scheduler`` — beat, every 15 minutes, once per org via
   ``for_each_org``: reconcile, bounce guard, warm-up, daily discovery, drafts,
   and scheduling this tick's sends.
+* ``run_campaign_now`` — the same tick for one campaign, dispatched by
+  ``POST /campaigns`` so a new campaign starts searching immediately.
 * ``send_campaign_prospect`` — one send, dispatched by the scheduler with a
   countdown so consecutive sends are 120–300s apart. Bound to the prospect's
   org with ``org_scope``; the claim inside ``send_prospect`` makes a duplicate
@@ -46,6 +48,22 @@ def run_campaign_scheduler():
     except Exception as exc:  # noqa: BLE001
         logger.error("run_campaign_scheduler failed: %s", exc)
         return {"status": "error", "error": str(exc)}
+
+
+@celery_app.task(name="app.tasks.campaigns.run_campaign_now")
+def run_campaign_now(org_id: str, campaign_id: str):
+    """Run one campaign's tick now — dispatched when the campaign is created."""
+
+    async def _run():
+        from app.database_celery import celery_session
+        from app.org_context import org_scope
+        from app.services.campaigns import run_campaign_now as run_now
+
+        async with org_scope(uuid.UUID(org_id)):
+            async with celery_session() as db:
+                return await run_now(db, uuid.UUID(campaign_id), schedule=_schedule)
+
+    return _run_async(_run())
 
 
 @celery_app.task(name="app.tasks.campaigns.send_campaign_prospect")
