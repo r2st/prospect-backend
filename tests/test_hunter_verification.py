@@ -776,8 +776,10 @@ async def test_verification_stats_endpoint(
 @pytest.mark.asyncio
 async def test_background_sweeps_can_be_switched_off(monkeypatch):
     """A free plan's allowance must not go to the backlog before anything mails it."""
-    from app.config import get_settings
+    from app.config import Settings, get_settings
     from app.tasks import verification
+
+    assert Settings.model_fields["hunter_background_sweeps"].default is False
 
     def _boom(*a, **kw):
         raise AssertionError("sweep must not touch Hunter when switched off")

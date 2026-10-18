@@ -254,12 +254,14 @@ class Settings(BaseSettings):
     # run concurrently within a batch (Hunter rate-limits per-second).
     hunter_max_batch: int = 100
     hunter_concurrency: int = 5
-    # The 15-minute verify_pending_contacts and weekly reverify sweeps. On a free
-    # Hunter plan (100 verifications/month) the pending sweep spends the month
-    # on the existing contact backlog in its first day; turning it off leaves
-    # the allowance to the paths that verify what is about to be mailed
-    # (Autopilot campaigns, verify-before-send, import).
-    hunter_background_sweeps: bool = True
+    # The 15-minute verify_pending_contacts and weekly reverify sweeps. Off by
+    # default: on a free Hunter plan (100 verifications/month) the pending sweep
+    # spends the month on the existing contact backlog in its first day, and the
+    # key arrives through the credential store, where no env flag can follow it.
+    # Off leaves the allowance to the paths that verify what is about to be
+    # mailed (Autopilot campaigns, verify-before-send, import). Turn it on with
+    # a paid plan.
+    hunter_background_sweeps: bool = False
 
     # --- DIY email pattern discovery ---
     # The free fallback under Hunter's email-finder: derive likely addresses from
