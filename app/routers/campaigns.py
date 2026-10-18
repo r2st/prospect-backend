@@ -945,3 +945,38 @@ async def save_draft_as_template(
     await db.refresh(t)
     return SavedTemplateOut(id=t.id, name=t.name, subject=t.subject, body=t.body,
                             campaign_template_mode=c.template_mode)
+
+
+
+@router.get("/{campaign_id}/attachments/file")
+async def get_campaign_attachment(
+    campaign_id: uuid.UUID,
+    name: str = Query(..., min_length=1, max_length=255),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """The bytes of one file this campaign's emails carry, for the draft preview.
+
+    Exactly what the send path attaches (:func:`svc._attachments`), looked up
+    by filename — so the preview can never show a file the email won't carry,
+    or miss one it will. PDFs are served inline for the viewer; anything else
+    as a download. Never cached: drafts change, and this is a tenant's file.
+    """
+    from urllib.parse import quote
+
+    from fastapi import Response
+
+    c = await _get_campaign(db, campaign_id, user)
+    match = next((a for a in await svc._attachments(db, c) if a.filename == name), None)
+    if match is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This campaign doesn't attach a file by that name.")
+    inline = match.content_type == "application/pdf"
+    return Response(
+        content=match.data,
+        media_type=match.content_type,
+        headers={
+            "Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(match.filename)}",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

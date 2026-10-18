@@ -317,3 +317,40 @@ def test_generalising_matches_whole_words_only():
     company = Company(name="Analytics Co")
     assert svc.generalize_draft("Hi Ana, Analytics Co loves analytics.", contact, company) == \
         "Hi {{first_name}}, {{company}} loves analytics."
+
+
+# ── the preview can open what the email carries ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_the_preview_can_fetch_an_attached_pdf(client, db_session):
+    doc = await _doc(db_session, filename="SteadyState Brief.pdf")
+    c = await _campaign(db_session, document_ids=[str(doc.id)], attach_documents=True)
+    r = await client.get(f"/api/v1/campaigns/{c.id}/attachments/file", params={"name": "SteadyState Brief.pdf"})
+    assert r.status_code == 200
+    assert r.content == PDF
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"].startswith("inline;")
+    assert "SteadyState%20Brief.pdf" in r.headers["content-disposition"]
+    assert r.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.asyncio
+async def test_only_files_the_email_actually_carries_can_be_fetched(client, db_session):
+    doc = await _doc(db_session)
+    off = await _campaign(db_session, document_ids=[str(doc.id)], attach_documents=False)
+    url = f"/api/v1/campaigns/{off.id}/attachments/file"
+    # Attaching is off: the document exists but the email won't carry it.
+    assert (await client.get(url, params={"name": "Partner_Brief.pdf"})).status_code == 404
+    on = await _campaign(db_session, document_ids=[str(doc.id)], attach_documents=True)
+    url = f"/api/v1/campaigns/{on.id}/attachments/file"
+    assert (await client.get(url, params={"name": "other.pdf"})).status_code == 404
+    assert (await client.get(f"/api/v1/campaigns/{uuid.uuid4()}/attachments/file",
+                             params={"name": "Partner_Brief.pdf"})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_word_attachment_downloads_rather_than_renders(client, db_session):
+    doc = await _doc(db_session, filename="brief.docx", file_type="docx", content=b"PK\x03\x04docx")
+    c = await _campaign(db_session, document_ids=[str(doc.id)], attach_documents=True)
+    r = await client.get(f"/api/v1/campaigns/{c.id}/attachments/file", params={"name": "brief.docx"})
+    assert r.status_code == 200 and r.headers["content-disposition"].startswith("attachment;")
