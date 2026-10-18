@@ -686,6 +686,7 @@ async def _resolve_missing_emails(
         ).scalars().all()
     )
     targets: list[tuple[Company, Contact]] = []
+    nameless: list[Company] = []
     for company in companies:
         if company.id in has_email:
             continue
@@ -701,19 +702,89 @@ async def _resolve_missing_emails(
         )
         if contact is not None:
             targets.append((company, contact))
-        elif named:
-            logger.info(
-                "Campaign discovery: %s has no plausible contact name (%r) — not searching",
-                company.domain, [f"{c.first_name} {c.last_name or ''}".strip() for c in named][:3],
-            )
-    if not targets:
+        else:
+            if named:
+                logger.info(
+                    "Campaign discovery: %s has no plausible contact name (%r) — trying domain search",
+                    company.domain, [f"{c.first_name} {c.last_name or ''}".strip() for c in named][:3],
+                )
+            nameless.append(company)
+    if not targets and not nameless:
         return stats
-    stats, _ = await _address_contacts(db, targets, grounded=grounded)
+    from app.services import hunter_verification
+
+    hunter = hunter_verification.get_hunter_service()
+    budget = await hunter.make_budget(db) if hunter.enabled else None
+    if targets:
+        stats, _ = await _address_contacts(db, targets, grounded=grounded, budget=budget)
+    if nameless and hunter.enabled:
+        found = await _people_by_domain(db, nameless, hunter=hunter, budget=budget)
+        stats["domain_searched"] += found["searched"]
+        stats["found"] += found["found"]
+        stats["verified"] += found["verified"]
+        stats["no_mx"] += found["no_mx"]
     return stats
 
 
+async def _people_by_domain(
+    db: AsyncSession, companies: list[Company], *, hunter, budget
+) -> dict[str, int]:
+    """One Hunter domain search per company that has a domain and nobody named.
+
+    Web results name companies far more often than people — of the first web
+    run's seven companies only one came with a person — and without a person
+    the finder has nothing to search for, so the company was recorded as
+    ``no_email`` and given up on. A domain search (one credit) returns the
+    people Hunter knows at that domain; the best *personal* address with a name
+    becomes the company's contact and is verified like any other. A generic
+    ``info@`` is not taken: it lands in a shared inbox, and catch-all domains
+    are exactly where those come back "deliverable".
+    """
+    from app.services import email_validation
+
+    out = {"searched": 0, "found": 0, "verified": 0, "no_mx": 0}
+    for company in companies:
+        if await asyncio.to_thread(email_validation.check_mx, company.domain) == "invalid":
+            out["no_mx"] += 1
+            continue
+        out["searched"] += 1
+        result = await hunter.domain_search(db, company.domain, budget=budget)
+        person = next(
+            (
+                e for e in result.get("emails") or []
+                if e.get("type") == "personal" and e.get("email")
+                and plausible_person_name(e.get("first_name"), e.get("last_name"))
+            ),
+            None,
+        )
+        if person is None:
+            continue
+        email = person["email"].strip().lower()
+        if (await db.execute(
+            select(Contact.id).where(func.lower(Contact.email) == email).limit(1)
+        )).first() is not None:
+            continue  # someone already holds this address; contacts dedup by email
+        contact = Contact(
+            company_id=company.id, first_name=person.get("first_name"),
+            last_name=person.get("last_name"), title=person.get("position"),
+            email=email, source="hunter_domain_search",
+        )
+        db.add(contact)
+        await db.flush()
+        out["found"] += 1
+        verdict = await hunter.verify_contact(db, contact, budget=budget)
+        if verdict.get("result") == VERIFIED:
+            out["verified"] += 1
+        _stamp_origin(contact, "hunter_domain_search")
+    await db.flush()
+    if out["searched"]:
+        logger.info("Campaign discovery domain search: %s", out)
+    return out
+
+
 async def _address_contacts(
-    db: AsyncSession, targets: list[tuple[Company, Contact]], *, grounded: bool = True
+    db: AsyncSession, targets: list[tuple[Company, Contact]], *, grounded: bool = True,
+    budget=None,
 ) -> tuple[dict[str, int], list[Contact]]:
     """Find, guess or replace an address for each ``(company, contact)``, then verify.
 
@@ -742,7 +813,8 @@ async def _address_contacts(
     stats = {"found": 0, "guessed": 0, "verified": 0, "domain_searched": 0, "no_mx": 0}
     addressed: list[Contact] = []
     hunter = hunter_verification.get_hunter_service()
-    budget = await hunter.make_budget(db) if hunter.enabled else None
+    if budget is None and hunter.enabled:
+        budget = await hunter.make_budget(db)
     for company, contact in targets:
         if await asyncio.to_thread(email_validation.check_mx, company.domain) == "invalid":
             stats["no_mx"] += 1
@@ -882,6 +954,33 @@ async def _known_domains(db: AsyncSession) -> list[str]:
     return list(dict.fromkeys(d for d, _ in [*held, *discovered]))[:KNOWN_DOMAINS_LIMIT]
 
 
+async def _known_company_names(db: AsyncSession) -> list[str]:
+    """Names of companies discovery or a campaign already holds, most recent first.
+
+    The name half of :func:`_known_domains`: a company found without a domain is
+    stored without one, so excluding by domain alone let it come straight back
+    (Razorpay, on the first web-search run).
+    """
+    held = (
+        await db.execute(
+            select(Company.name)
+            .join(CampaignProspect, CampaignProspect.company_id == Company.id)
+            .group_by(Company.name)
+            .order_by(func.max(CampaignProspect.created_at).desc(), Company.name)
+            .limit(KNOWN_DOMAINS_LIMIT)
+        )
+    ).scalars().all()
+    discovered = (
+        await db.execute(
+            select(Company.name)
+            .where(or_(Company.source.in_(DISCOVERY_SOURCES), Company.source.like("%+%")))
+            .order_by(Company.created_at.desc(), Company.id)
+            .limit(KNOWN_DOMAINS_LIMIT)
+        )
+    ).scalars().all()
+    return list(dict.fromkeys(n for n in [*held, *discovered] if n))[:KNOWN_DOMAINS_LIMIT]
+
+
 async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
     from app.services import gemini_discovery
     from app.services.ingestion import get_ingestion_service
@@ -904,6 +1003,8 @@ async def _search_companies(db: AsyncSession, campaign: Campaign) -> int:
         max_employees=icp.company_size.max,
         limit=DISCOVERY_COMPANIES,
         exclude_domains=seen,
+        exclude_names=await _known_company_names(db),
+        offering=icp.offering or icp.summary,
     )
     result = await get_ingestion_service().ingest(db, found.records)
     company_ids = [o.company_id for o in result.outcomes if o.company_id]

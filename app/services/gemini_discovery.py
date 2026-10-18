@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import org_gemini
 from app.services.ingestion import CandidateRecord, ContactRecord
-from app.services.normalize import normalize_domain
+from app.services.normalize import normalize_domain, normalize_name_key
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,47 @@ class GeminiSearchAnswer(BaseModel):
         return v if isinstance(v, list) else []
 
 
+# Trailing words that describe a company rather than name it. Stripped (after
+# normalize_name_key's legal suffixes) so "Razorpay Software Pvt Ltd" and
+# "Razorpay" are one company for exclusion. Only trailing, and never down to
+# nothing, so "Software AG" and a firm actually called "Solutions" survive.
+_DESCRIPTOR_WORDS = {
+    "software", "technologies", "technology", "tech", "solutions", "systems",
+    "labs", "lab", "group", "holdings", "services", "global", "international",
+    "india", "usa", "us", "uk", "hq", "platform", "platforms", "cloud", "ai", "io",
+}
+
+
+def company_match_key(name: Optional[str]) -> Optional[str]:
+    """A looser key than ``normalize_name_key``, for "already found?" checks only."""
+    key = normalize_name_key(name)
+    if not key:
+        return None
+    parts = key.split(" ")
+    while len(parts) > 1 and parts[-1] in _DESCRIPTOR_WORDS:
+        parts.pop()
+    return " ".join(parts)
+
+
+def customer_clause(offering: str) -> str:
+    """Find buyers of the offering, not companies that sell something like it.
+
+    A profile built from the operator's own brief describes what *they* sell, and
+    a search for its keywords ("AIOps", "incident remediation") returns the
+    vendors of that category first: the first web run proposed Komodor and
+    Squadcast, both sellers of incident tooling, to a campaign selling incident
+    remediation.
+    """
+    offering = (offering or "").strip()
+    what = f" ({offering[:300]})" if offering else ""
+    return (
+        f"Find potential CUSTOMERS — companies that would buy what we sell{what}. "
+        "Exclude companies that sell a similar, competing or adjacent product or "
+        "service themselves (vendors, tool makers, consultancies offering the "
+        "same thing): they are competitors, not buyers."
+    )
+
+
 def build_prompt(
     *,
     query: str = "",
@@ -102,6 +143,7 @@ def build_prompt(
     min_employees: Optional[int],
     max_employees: Optional[int],
     limit: int,
+    offering: str = "",
 ) -> str:
     criteria = []
     if industry.strip():
@@ -126,6 +168,8 @@ def build_prompt(
         if not criteria:
             criteria.append("- Any industry and location")
         head = f"Find up to {limit} companies matching:\n" + "\n".join(criteria) + "\n"
+    if offering:
+        head = customer_clause(offering) + "\n\n" + head
     return (
         head
         + "\nFor each, list up to 3 key decision-makers (founder, CEO, owner, "
@@ -286,6 +330,8 @@ async def search_companies(
     max_employees: Optional[int] = None,
     limit: int = 10,
     exclude_domains: Optional[list[str]] = None,
+    exclude_names: Optional[list[str]] = None,
+    offering: str = "",
 ) -> SearchResult:
     """Find companies, as grounded as the org's keys allow.
 
@@ -298,8 +344,13 @@ async def search_companies(
     3. Otherwise the org's other LLMs answer from training data, flagged
        ``grounded=False`` with a notice.
 
-    ``exclude_domains`` are companies the caller already has; they are dropped
-    from the results (and named to the model, which helps an ungrounded one).
+    ``exclude_domains`` / ``exclude_names`` are companies the caller already
+    has; they are dropped from the results (and named to the model, which helps
+    an ungrounded one). Names matter as much as domains: a company found
+    without a domain is stored without one, and "Razorpay" came back on the
+    next run because only domains were excluded. ``offering`` is what the
+    operator sells, so the search can ask for its buyers rather than its
+    competitors (:func:`customer_clause`).
 
     Raises ``org_gemini.GeminiKeyMissing`` / ``GeminiError``.
     """
@@ -307,6 +358,7 @@ async def search_companies(
 
     keywords = keywords or []
     exclude = {d for d in (normalize_domain(x) for x in exclude_domains or []) if d}
+    exclude_keys = {k for k in (company_match_key(n) for n in exclude_names or []) if k}
     prompt = build_prompt(
         query=query,
         industry=industry,
@@ -315,11 +367,13 @@ async def search_companies(
         min_employees=min_employees,
         max_employees=max_employees,
         limit=limit,
+        offering=offering,
     )
-    if exclude:
+    known = [*sorted(exclude)[:40], *sorted(n for n in (exclude_names or []) if n)[:40]]
+    if known:
         prompt += (
             "\n\nDo not include any of these companies; they have already been "
-            f"found: {', '.join(sorted(exclude)[:40])}."
+            f"found: {', '.join(known)}."
         )
     llm_keys = await org_gemini.get_org_llm_keys(db, org_id)
     if not llm_keys:
@@ -333,7 +387,7 @@ async def search_companies(
                     db, org_id, system=SYSTEM, prompt=prompt, schema=GeminiSearchAnswer,
                 )
                 return _result(answer.data, provider=answer.provider, grounded=True,
-                               sources=answer.sources, notice=None, exclude=exclude,
+                               sources=answer.sources, notice=None, exclude=exclude, exclude_keys=exclude_keys,
                                min_employees=min_employees, max_employees=max_employees,
                                limit=limit, org_id=org_id)
             except org_gemini.GeminiError as exc:
@@ -343,6 +397,7 @@ async def search_companies(
                 db, org_id, query=query, industry=industry, location=location,
                 keywords=keywords, min_employees=min_employees,
                 max_employees=max_employees, limit=limit, exclude=exclude,
+                exclude_keys=exclude_keys, offering=offering,
             )
         except (web_search.WebSearchError, org_gemini.GeminiError) as exc:
             logger.warning("Org %s web-grounded discovery failed: %s", org_id, exc)
@@ -355,6 +410,7 @@ async def search_companies(
     )
     return _result(answer.data, provider=answer.provider, grounded=answer.grounded,
                    sources=answer.sources, notice=answer.notice, exclude=exclude,
+                   exclude_keys=exclude_keys,
                    min_employees=min_employees, max_employees=max_employees,
                    limit=limit, org_id=org_id)
 
@@ -363,10 +419,13 @@ def _result(
     data: GeminiSearchAnswer, *, provider: str, grounded: bool, sources: list[dict],
     notice: Optional[str], exclude: set[str], min_employees: Optional[int],
     max_employees: Optional[int], limit: int, org_id: uuid.UUID,
+    exclude_keys: Optional[set[str]] = None,
 ) -> SearchResult:
-    if exclude:
+    if exclude or exclude_keys:
         data = GeminiSearchAnswer(companies=[
-            c for c in data.companies if normalize_domain(_clean(c.domain)) not in exclude
+            c for c in data.companies
+            if normalize_domain(_clean(c.domain)) not in exclude
+            and company_match_key(_clean(c.name)) not in (exclude_keys or set())
         ])
     records, extras = to_records(
         data, min_employees=min_employees, max_employees=max_employees,
@@ -428,18 +487,20 @@ def web_queries(
     return list(dict.fromkeys(" ".join(a.split()) for a in angles))[:max(1, n)]
 
 
-def web_prompt(hits: list, criteria: str, limit: int) -> str:
+def web_prompt(hits: list, criteria: str, limit: int, offering: str = "") -> str:
     lines = [
         f"[{i}] {h.title}\nURL: {h.url}\n{h.snippet}" for i, h in enumerate(hits, 1)
     ]
     return (
         "Search results:\n<<<RESULTS\n" + "\n\n".join(lines) + "\nRESULTS>>>\n\n"
+        + customer_clause(offering) + "\n\n"
         f"From these results only, list up to {limit} distinct companies that could "
         "be customers matching the criteria below. Prefer the companies themselves "
-        "over the directories, blogs or vendors that list them. Use the company's own "
-        "website domain when a result shows it; otherwise null. For contacts, list "
-        "only people the results name, with their title; email only when the "
-        "results print it.\n\n"
+        "over the directories, blogs or vendors that list them. For each company's "
+        "domain, give its own website domain: from the results when they show it, "
+        "otherwise the domain you know for that company; null only when you don't "
+        "know it. For contacts, list only people the results name, with their "
+        "title; email only when the results print it.\n\n"
         f"Criteria:\n{criteria}\n\n"
         "Return exactly this JSON shape:\n"
         '{"companies": [{"name": str, "domain": str|null, "industry": str, "city": str, '
@@ -491,7 +552,7 @@ def ground_in_hits(answer: GeminiSearchAnswer, hits: list) -> GeminiSearchAnswer
 async def _web_grounded(
     db: AsyncSession, org_id: uuid.UUID, *, query: str, industry: str, location: str,
     keywords: list[str], min_employees: Optional[int], max_employees: Optional[int],
-    limit: int, exclude: set[str],
+    limit: int, exclude: set[str], exclude_keys: Optional[set[str]] = None, offering: str = "",
 ) -> SearchResult:
     from app.config import get_settings
     from app.services import web_search
@@ -510,13 +571,13 @@ async def _web_grounded(
         min_employees=min_employees, max_employees=max_employees, limit=limit,
     ).split("\nFor each,", 1)[0]
     answer = await org_gemini.generate_json_answer(
-        db, org_id, system=WEB_SYSTEM, prompt=web_prompt(hits, criteria, limit),
+        db, org_id, system=WEB_SYSTEM, prompt=web_prompt(hits, criteria, limit, offering),
         schema=GeminiSearchAnswer, max_tokens=8192, timeout=90.0,
     )
     grounded = ground_in_hits(answer.data, hits)
     sources = [{"title": h.title, "url": h.url} for h in hits]
     return _result(
         grounded, provider=f"{provider}+{answer.provider}", grounded=True, sources=sources,
-        notice=None, exclude=exclude, min_employees=min_employees,
+        notice=None, exclude=exclude, exclude_keys=exclude_keys, min_employees=min_employees,
         max_employees=max_employees, limit=limit, org_id=org_id,
     )

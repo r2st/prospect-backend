@@ -476,6 +476,8 @@ async def _run_search(db_session, monkeypatch, hunter, companies, *, grounded=Tr
     async def fake_search(*a, **kw):
         _run_search.last_query = kw.get("query")
         _run_search.last_exclude = kw.get("exclude_domains")
+        _run_search.last_names = kw.get("exclude_names")
+        _run_search.last_offering = kw.get("offering")
         return SimpleNamespace(records=[], provider="groq", grounded=_run_search.grounded)
 
     class FakeIngest:
@@ -777,12 +779,16 @@ def test_plausible_person_name(first, last, ok):
 
 
 @pytest.mark.asyncio
-async def test_a_placeholder_contact_spends_no_hunter_credit(db_session, monkeypatch):
+async def test_a_placeholder_contact_is_never_searched_or_guessed(db_session, monkeypatch):
+    """No finder call and no john@ guess for "John K. (Placeholder for CTO)".
+    The company still gets its one domain search — the placeholder names no one,
+    which is exactly the nobody-named case — and here Hunter knows nobody."""
     co, ct = await _named(db_session, "veeva.com", first="John", last="K. (Placeholder for CTO)")
     hunter = _FakeHunter()
     campaign, queued = await _run_search(db_session, monkeypatch, hunter, [co])
     assert queued == 0
     assert hunter.find_calls == [] and hunter.verify_calls == []
+    assert hunter.domain_calls == ["veeva.com"]
     await db_session.refresh(ct)
     assert ct.email is None
     rows = (await db_session.execute(
@@ -1218,3 +1224,81 @@ async def test_nothing_hunter_hasnt_called_deliverable_reaches_the_wire(
     assert sent == []
     await db_session.refresh(p)
     assert p.status == status and p.scheduled_for is None
+
+
+
+# ── companies with nobody named: Hunter domain search ────────────────────────
+
+async def _bare(db, domain, name=None):
+    co = Company(name=name or f"Co {domain}", domain=domain, source="tavily+gemini")
+    db.add(co)
+    await db.commit()
+    return co
+
+
+@pytest.mark.asyncio
+async def test_a_company_with_a_domain_and_nobody_named_gets_a_domain_search(db_session, monkeypatch):
+    co = await _bare(db_session, "obsium.io", "Obsium")
+    hunter = _FakeHunter(people={"obsium.io": [
+        {"email": "info@obsium.io", "type": "generic", "score": 95, "first_name": None},
+        {"email": "rahul@obsium.io", "type": "personal", "score": 88,
+         "first_name": "Rahul", "last_name": "Mehta", "position": "Head of Platform"},
+    ]})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 1 and hunter.domain_calls == ["obsium.io"]
+    ct = (await db_session.execute(select(Contact).where(Contact.company_id == co.id))).scalars().one()
+    # The personal address, not the shared info@ inbox, and verified before queueing.
+    assert (ct.first_name, ct.title, ct.email) == ("Rahul", "Head of Platform", "rahul@obsium.io")
+    assert hunter.verify_calls == ["rahul@obsium.io"]
+    assert ct.email_verification_meta["email_origin"] == "hunter_domain_search"
+
+
+@pytest.mark.asyncio
+async def test_a_domain_search_with_only_generic_addresses_takes_nothing(db_session, monkeypatch):
+    co = await _bare(db_session, "generic.io")
+    hunter = _FakeHunter(people={"generic.io": [
+        {"email": "info@generic.io", "type": "generic", "score": 99, "first_name": None}]})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 0
+    assert (await db_session.execute(select(Contact).where(Contact.company_id == co.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_no_domain_search_on_a_domain_with_no_mail_server(db_session, monkeypatch):
+    from app.services import email_validation
+
+    monkeypatch.setattr(email_validation, "check_mx", lambda d: "invalid")
+    co = await _bare(db_session, "dead.io")
+    hunter = _FakeHunter(people={"dead.io": [{"email": "a@dead.io", "type": "personal", "first_name": "A"}]})
+    await _run_search(db_session, monkeypatch, hunter, [co])
+    assert hunter.domain_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_domain_search_address_someone_already_holds_is_not_reused(db_session, monkeypatch):
+    holder = await _contact(db_session, "rahul@taken.io")
+    co = await _bare(db_session, "taken2.io")
+    hunter = _FakeHunter(people={"taken2.io": [
+        {"email": "rahul@taken.io", "type": "personal", "first_name": "Rahul", "last_name": "M"}]})
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 0 and holder.email == "rahul@taken.io"
+
+
+@pytest.mark.asyncio
+async def test_without_hunter_a_nameless_company_spends_nothing(db_session, monkeypatch):
+    co = await _bare(db_session, "nokey.io")
+    hunter = _FakeHunter(enabled=False)
+    _, queued = await _run_search(db_session, monkeypatch, hunter, [co])
+    assert queued == 0 and hunter.domain_calls == []
+
+
+# ── what the search is asked, and what it is told to leave out ───────────────
+
+@pytest.mark.asyncio
+async def test_discovery_passes_known_names_and_the_offering(db_session, monkeypatch):
+    db_session.add(Company(name="Razorpay", domain=None, source="tavily+gemini"))
+    await db_session.commit()
+    co, _ = await _named(db_session, "fresh3.com")
+    await _run_search(db_session, monkeypatch, _FakeHunter(enabled=False), [co])
+    assert "Razorpay" in _run_search.last_names
+    assert _run_search.last_offering == "We sell widgets"

@@ -313,3 +313,67 @@ async def test_a_person_without_an_email_is_not_re_inserted_on_the_next_run(db_s
     co = (await db_session.execute(select(Company).where(Company.domain == "stripe.com"))).scalars().one()
     names = (await db_session.execute(select(Contact.first_name).where(Contact.company_id == co.id))).scalars().all()
     assert sorted(names) == ["John", "Patrick"]
+
+
+
+# ── customers, not competitors; domains from knowledge; names excluded ──────
+
+def test_the_prompts_ask_for_buyers_not_competitors():
+    criteria_prompt = gemini_discovery.build_prompt(
+        query="SRE teams", industry="", location="", keywords=[], min_employees=None,
+        max_employees=None, limit=5, offering="Autonomous incident remediation")
+    web = gemini_discovery.web_prompt(_hits(), "criteria", 5, "Autonomous incident remediation")
+    for p in (criteria_prompt, web):
+        assert "CUSTOMERS" in p and "Autonomous incident remediation" in p
+        assert "competitors, not buyers" in p
+    # Without an offering (the manual Discovery search) the prompt is unchanged.
+    plain = gemini_discovery.build_prompt(query="x", industry="", location="", keywords=[],
+                                          min_employees=None, max_employees=None, limit=5)
+    assert "CUSTOMERS" not in plain
+
+
+def test_the_web_prompt_asks_for_a_known_domain_when_the_results_omit_it():
+    web = gemini_discovery.web_prompt(_hits(), "criteria", 5)
+    assert "otherwise the domain you know" in web
+
+
+def test_a_known_domain_for_a_named_company_survives_grounding():
+    """Komodor and Squadcast were named in listicles that printed no domains;
+    the model's known domain is kept because the name is in the results."""
+    hits = [SearchHit("Top incident tools", "https://blog.example/x", "Komodor and Squadcast lead the pack")]
+    answer = GeminiSearchAnswer(companies=[
+        GeminiCompany(name="Komodor", domain="komodor.com"),
+        GeminiCompany(name="Squadcast", domain="squadcast.com"),
+    ])
+    kept = gemini_discovery.ground_in_hits(answer, hits)
+    assert {c.domain for c in kept.companies} == {"komodor.com", "squadcast.com"}
+
+
+@pytest.mark.asyncio
+async def test_known_names_are_filtered_even_without_a_domain(db_session, monkeypatch):
+    await _keys(db_session, gemini="g")
+
+    async def grounded(*a, prompt, **kw):
+        assert "Razorpay" in prompt
+        return org_gemini.GroundedAnswer(data=_answer(
+            GeminiCompany(name="Razorpay Software Pvt Ltd", domain=None),
+            GeminiCompany(name="Fresh Co", domain="fresh.co")))
+
+    monkeypatch.setattr(org_gemini, "generate_grounded_json", grounded)
+    found = await gemini_discovery.search_companies(
+        db_session, ORG, query="q", exclude_names=["Razorpay"])
+    assert [r.name for r in found.records] == ["Fresh Co"]
+
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("Razorpay", "Razorpay Software Pvt Ltd", True),
+    ("Gart Solutions", "gart solutions inc.", True),
+    ("Komodor", "Komodor Technologies", True),
+    ("Precision Manufacturing", "Precision Tools", False),   # never a prefix match
+    ("Solutions", "Solutions", True),                         # never stripped to nothing
+    ("Cloud Solutions", "Acme Cloud", False),
+])
+def test_company_match_key(a, b, same):
+    assert (gemini_discovery.company_match_key(a) == gemini_discovery.company_match_key(b)) is same
+    assert gemini_discovery.company_match_key(a)
