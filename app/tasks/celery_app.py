@@ -452,6 +452,11 @@ celery_app.conf.update(
             "task": "app.tasks.campaigns.run_campaign_scheduler",
             "schedule": 900.0,  # every 15 minutes
         },
+        # Campaign sends whose worker died between claim and outcome.
+        "reap-stuck-campaign-sends": {
+            "task": "app.tasks.campaigns.reap_stuck_campaign_sends",
+            "schedule": 600.0,  # every 10 minutes
+        },
         "purge-expired-discovery-document-files": {
             "task": "app.tasks.discovery_documents.purge_expired_document_files",
             "schedule": crontab(hour=3, minute=40),

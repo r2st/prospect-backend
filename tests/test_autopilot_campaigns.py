@@ -1360,9 +1360,18 @@ async def test_a_short_day_searches_again_a_few_hours_later(db_session, monkeypa
     later = MIDWEEK + timedelta(hours=2, minutes=1)
     assert await svc.discovery_due(db_session, c, later)
     await svc.discover_prospects(db_session, c, later)
-    await svc.discover_prospects(db_session, c, later + timedelta(hours=3))
-    # Three searches a day on its own, then it waits for tomorrow.
-    assert not await svc.discovery_due(db_session, c, later + timedelta(hours=6))
+    # Jump to the last automatic search of the day: the cap is a count, and
+    # walking there two hours at a time would cross the campaign's midnight.
+    await db_session.refresh(log)
+    log.discovery_runs = svc.AUTO_DISCOVERY_RUNS - 1
+    await db_session.commit()
+    last = later + svc.DISCOVERY_TOPUP_GAP
+    assert await svc.discovery_due(db_session, c, last)
+    await svc.discover_prospects(db_session, c, last)
+    # Budget spent: no more automatic searches until tomorrow (still the same
+    # local day in Toronto).
+    assert svc.local_today(c, last + svc.DISCOVERY_TOPUP_GAP) == svc.local_today(c, MIDWEEK)
+    assert not await svc.discovery_due(db_session, c, last + svc.DISCOVERY_TOPUP_GAP)
     assert len(runs) == 3
 
 

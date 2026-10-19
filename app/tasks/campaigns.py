@@ -135,3 +135,19 @@ def send_campaign_prospect(org_id: str, prospect_id: str):
                 return {"status": outcome.status, "detail": outcome.detail}
 
     return _run_async(_run())
+
+
+@celery_app.task(name="app.tasks.campaigns.reap_stuck_campaign_sends")
+def reap_stuck_campaign_sends():
+    """Beat task: fail and report campaign sends stuck in ``sending``."""
+
+    async def _body(db):
+        from app.services.campaigns import reap_stuck_sends
+
+        return await reap_stuck_sends(db)
+
+    try:
+        return _run_async(for_each_org(_body, label="reap_stuck_campaign_sends"))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("reap_stuck_campaign_sends failed: %s", exc)
+        return {"status": "error", "error": str(exc)}

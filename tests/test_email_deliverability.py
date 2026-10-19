@@ -602,10 +602,18 @@ class TestV4Deliverability:
 class TestAntiSpamHeaders:
     """Verify RFC 2369 List-Unsubscribe and RFC 8058 one-click headers."""
 
-    def test_list_unsubscribe_url_generated(self):
-        """Unsubscribe URL should be generated for any contact email."""
+    def test_list_unsubscribe_url_generated(self, monkeypatch):
+        """Unsubscribe URL should be generated for any contact email.
+
+        Pins ``tracking_base_url`` rather than reading it from the machine's
+        ``.env``: a developer box points it at ``http://localhost:8000``, and
+        the assertion is about how the link is built, not about that box.
+        """
+        from app.config import get_settings
+
+        monkeypatch.setattr(get_settings(), "tracking_base_url", "https://prospect.doaide.com")
         url = _make_unsubscribe_url("test@example.com")
-        assert url.startswith("https://")
+        assert url.startswith("https://prospect.doaide.com/api/v1/track/unsubscribe")
         assert "unsubscribe" in url
         assert "token=" in url
 

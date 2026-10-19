@@ -1502,6 +1502,33 @@ def send_sequence_step(self, enrollment_id: str):
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
 
 
+# An org that pauses sending stays paused for days, and the queue sweep runs
+# every five minutes: a WARNING per pass buried every other warning in the
+# worker log. Once an hour per org is enough to know it is still engaged.
+KILL_SWITCH_LOG_INTERVAL_SECONDS = 3600
+_kill_switch_last_logged: dict = {}
+
+
+def _log_kill_switch_halt(now: float | None = None) -> bool:
+    """Log the halted-queue warning at most once an hour per org. True if logged."""
+    import time
+
+    from app.org_context import get_current_org_id
+
+    org_id = get_current_org_id()
+    now = time.monotonic() if now is None else now
+    last = _kill_switch_last_logged.get(org_id)
+    if last is not None and now - last < KILL_SWITCH_LOG_INTERVAL_SECONDS:
+        logger.debug("Dialtone paused for org %s (kill switch still engaged)", org_id)
+        return False
+    _kill_switch_last_logged[org_id] = now
+    logger.warning(
+        "Dialtone paused: outreach queue halted for org %s — sending kill switch engaged "
+        "(repeats suppressed for %d min)", org_id, KILL_SWITCH_LOG_INTERVAL_SECONDS // 60,
+    )
+    return True
+
+
 @celery_app.task(name="app.tasks.outreach.process_outreach_queue")
 def process_outreach_queue():
     """Periodic task: find all active enrollments due for their next step and dispatch sends.
@@ -1519,7 +1546,7 @@ def process_outreach_queue():
             from app.services import system_settings
 
             if not await system_settings.is_sending_enabled(db):
-                logger.warning("Dialtone paused: outreach queue halted — sending kill switch engaged")
+                _log_kill_switch_halt()
                 return {"status": "halted", "reason": "sending kill switch engaged", "dispatched": 0}
 
             # Enrollments of *live* campaigns only. A paused sequence

@@ -1846,6 +1846,56 @@ async def _release(db: AsyncSession, prospect_id: uuid.UUID, **values) -> None:
     await db.commit()
 
 
+# A claim older than this with no outcome means the worker died mid-send: the
+# task hard limit is 10 minutes, so nothing legitimate is still in flight.
+STUCK_SEND_AFTER = timedelta(minutes=30)
+
+
+async def reap_stuck_sends(db: AsyncSession, now: Optional[datetime] = None) -> dict:
+    """Close out prospects stuck in ``sending`` and say so on their campaign.
+
+    ``sending`` is committed before the wire so a crash can never make a
+    prospect eligible again — which also means a crash leaves it there forever,
+    invisible: not sent, not failed, not retried. After :data:`STUCK_SEND_AFTER`
+    this marks it ``failed`` with the same "outcome unknown, not retried" stance
+    the send path takes when the transport raises, keeps ``sent_at`` (the claim
+    time), and records an error on the campaign's daily log so the operator
+    sees it and can check the mailbox's Sent folder before resending.
+    """
+    now = _aware(now)
+    rows = (
+        await db.execute(
+            select(CampaignProspect)
+            .where(
+                CampaignProspect.status == "sending",
+                CampaignProspect.sent_at < now - STUCK_SEND_AFTER,
+            )
+            .order_by(CampaignProspect.sent_at, CampaignProspect.id)
+        )
+    ).scalars().all()
+    by_campaign: dict = {}
+    for p in rows:
+        p.status = "failed"
+        p.error = (
+            "Send outcome unknown: the worker stopped mid-send and the claim was never "
+            "settled. Check the mailbox's Sent folder before resending."
+        )
+        by_campaign.setdefault(p.campaign_id, []).append(p.to_email or str(p.id))
+    for campaign_id, addresses in by_campaign.items():
+        campaign = await db.get(Campaign, campaign_id)
+        if campaign is not None:
+            await log_error(
+                db, campaign,
+                f"{len(addresses)} send(s) stuck for over "
+                f"{int(STUCK_SEND_AFTER.total_seconds() // 60)} min marked failed "
+                f"(outcome unknown, not retried): {', '.join(addresses[:10])}",
+                now,
+            )
+        logger.error("Campaign %s: %d stuck send(s) marked failed", campaign_id, len(addresses))
+    await db.commit()
+    return {"reaped": len(rows), "campaigns": len(by_campaign)}
+
+
 async def send_prospect(
     db: AsyncSession, prospect_id: uuid.UUID, now: Optional[datetime] = None
 ) -> SendOutcome:
