@@ -368,6 +368,9 @@ async def resolve_sender_info(
 
 
 POWERED_BY_URL = "https://prospect.doaide.com"
+# Sender identity line for CAN-SPAM/CASL, which require a physical address on
+# commercial mail. Kept to one short line under the unsubscribe link.
+SENDER_ADDRESS_LINE = "DoAide · Bangalore, India"
 
 
 def _make_unsubscribe_url(contact_email: str) -> str:
@@ -393,6 +396,7 @@ def _unsubscribe_footer_text(contact_email: str) -> str:
         "\n\n—\n"
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
+        f"{SENDER_ADDRESS_LINE}\n"
         f"Powered by DoAide Prospect — {POWERED_BY_URL}"
     )
 
@@ -405,6 +409,8 @@ def _unsubscribe_footer_html(contact_email: str) -> str:
         '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
         'Don\'t want these emails? Reply UNSUBSCRIBE or '
         f'<a href="{unsubscribe_url}" style="color:#9ca3af">unsubscribe here</a></p>'
+        '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
+        f'{html_mod.escape(SENDER_ADDRESS_LINE)}</p>'
         '<p style="margin:0;font-size:11px;color:#9ca3af">'
         f'<a href="{POWERED_BY_URL}" style="color:#9ca3af">Powered by DoAide Prospect</a></p>'
     )

@@ -62,6 +62,7 @@ class EmailSender:
             "\n\n—\n"
             f"Don't want these emails? Reply UNSUBSCRIBE or click: "
             f"{unsubscribe_url}\n"
+            "DoAide · Bangalore, India\n"
             "Powered by DoAide Prospect — https://prospect.doaide.com"
         )
 

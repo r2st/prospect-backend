@@ -438,7 +438,8 @@ class TestUnsubscribeCompliance:
         from app.services.email_dispatch import _unsubscribe_footer_html
         footer = _unsubscribe_footer_html("test@example.com")
         assert "Powered by DoAide Prospect" in footer
-        assert "Apprend" not in footer and "Bangalore" not in footer
+        assert "DoAide · Bangalore, India" in footer
+        assert "Apprend" not in footer
 
     def test_unsubscribe_footer_text_includes_link(self):
         from app.services.email_dispatch import _unsubscribe_footer_text

@@ -80,7 +80,7 @@ def limit_for_day(day: int, graduated_limit: Optional[int] = None) -> tuple[int,
 def day_for(start: date, today: Optional[date] = None) -> int:
     """1-based day on the ramp for ``start`` as of ``today`` (day 1 == start)."""
     if today is None:
-        today = datetime.now(timezone.utc).date()
+        today = send_day.local_date()
     if isinstance(start, datetime):
         start = start.date()
     return max(1, (today - start).days + 1)
@@ -155,7 +155,7 @@ async def ensure_warmup_plan(
         return existing
 
     if start is None:
-        start = datetime.now(timezone.utc).date()
+        start = send_day.local_date()
     day = day_for(start)
     limit, status = limit_for_day(day)
 
@@ -261,7 +261,7 @@ def credited_start_date(account, today: Optional[date] = None) -> date:
     ramp under observation instead of graduating instantly on a date field.
     """
     if today is None:
-        today = datetime.now(timezone.utc).date()
+        today = send_day.local_date()
 
     last_used = getattr(account, "last_used_at", None)
     if last_used is None:

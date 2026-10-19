@@ -45,7 +45,7 @@ against is stored that way.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from app.config import get_settings
@@ -83,6 +83,17 @@ def day_start(now: Optional[datetime] = None) -> datetime:
         hour=0, minute=0, second=0, microsecond=0
     )
     return local_midnight.astimezone(timezone.utc)
+
+
+def local_date(now: Optional[datetime] = None) -> date:
+    """The calendar date of the current sending day.
+
+    For day-granular state that has to agree with the counters above — the
+    warm-up ramp's day number most of all. That ramp stepped on the UTC date
+    while the per-mailbox count it is compared against rolled on this one, so a
+    mailbox's limit changed partway through its own sending day.
+    """
+    return _aware(now).astimezone(send_day_timezone()).date()
 
 
 def day_key(now: Optional[datetime] = None) -> str:

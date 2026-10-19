@@ -24,6 +24,7 @@ def test_footer_is_unsubscribe_and_powered_by_only():
         assert "unsubscribe" in footer.lower()
         assert "Powered by DoAide Prospect" in footer
         assert "https://prospect.doaide.com" in footer
+        assert "DoAide · Bangalore, India" in footer
         assert settings.company_postal_address not in footer
         assert settings.company_name not in footer
     assert '<a href="https://prospect.doaide.com"' in html

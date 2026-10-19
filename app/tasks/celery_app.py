@@ -246,7 +246,10 @@ celery_app.conf.update(
         # daily cap reflects today. Just after the UTC date rollover.
         "advance-warmup-progress": {
             "task": "app.tasks.warmup.advance_warmup_progress",
-            "schedule": crontab(hour=0, minute=10),  # daily 00:10 UTC
+            # Hourly, not daily: the ramp steps on the *sending* day
+            # (send_day.local_date), whose midnight isn't 00:00 UTC. advance_all
+            # is idempotent — a pass inside the same local day changes nothing.
+            "schedule": crontab(minute=10),
         },
         # Ingest delivery-failure notifications from the mailbox. Gmail is the
         # primary transport and has no bounce webhook — a DSN just lands in the
