@@ -135,6 +135,55 @@ def auto_enrich_companies():
     return _run_async(_run())
 
 
+async def _score_with_org_keys(db: AsyncSession, company: Company, ai) -> dict | None:
+    """Score one company on the org's own LLM keys, or ``None`` if that fails too.
+
+    ``AIService.score_lead`` runs on the deployment's keys and degrades to a
+    neutral 50 when they are exhausted — which is what happened when the
+    platform Anthropic key ran out of credit and Gemini was rate-limited: every
+    lead in every org scored "C, review manually". Discovery already falls back
+    to the org's own keys (``org_gemini``: Gemini → Anthropic → Groq →
+    OpenRouter); scoring now does the same before settling for the default.
+    """
+    from pydantic import BaseModel, Field
+
+    from app.org_context import get_current_org_id
+    from app.services import org_gemini
+
+    class _LeadScoreAnswer(BaseModel):
+        score: int = Field(ge=0, le=100)
+        grade: str = "C"
+        reasoning: str = ""
+        recommended_action: str = ""
+        priority: str = "medium"
+
+    org_id = get_current_org_id()
+    if org_id is None:
+        return None
+    prompt = ai.lead_score_prompt(
+        company.name,
+        company.industry_segment or "Unknown",
+        company.employee_count,
+        f"{company.city or ''}, {company.state_province or ''}, {company.country or ''}".strip(", "),
+    )
+    try:
+        answer = await org_gemini.generate_json(
+            db,
+            org_id,
+            system="You score B2B leads. Answer with a single JSON object only.",
+            prompt=prompt,
+            schema=_LeadScoreAnswer,
+            max_tokens=1024,
+        )
+    except (org_gemini.GeminiKeyMissing, org_gemini.GeminiError) as exc:
+        logger.info("Org-key lead scoring unavailable for %s: %s", company.name, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — never fail the batch over a fallback
+        logger.warning("Org-key lead scoring failed for %s: %s", company.name, exc)
+        return None
+    return answer.model_dump()
+
+
 @celery_app.task(name="app.tasks.enrichment.auto_score_leads")
 def auto_score_leads():
     """Periodic task: find companies with no AI score and score them."""
@@ -184,6 +233,12 @@ def auto_score_leads():
                         employee_count=company.employee_count,
                         location=f"{company.city or ''}, {company.state_province or ''}, {company.country or ''}".strip(", "),
                     )
+
+                    if score_result.get("degraded"):
+                        # The deployment's keys couldn't answer; try the org's own.
+                        org_result = await _score_with_org_keys(db, company, ai)
+                        if org_result is not None:
+                            score_result = org_result
 
                     if "error" not in score_result:
                         # Map AI response to LeadScore model fields

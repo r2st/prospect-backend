@@ -29,6 +29,7 @@ happened depletes the day without ever having been refusable. A cap that only
 counts one of five sources is not a cap; it is a number that agrees with itself.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -57,16 +58,28 @@ def _as_utc(value: datetime) -> datetime:
 # Lazily-created, cached async Redis client (mirrors app.services.api_key_auth).
 # Disabled on first failure so a persistent outage doesn't retry a dead socket
 # on every send.
+#
+# The client is cached *per event loop*. A redis.asyncio connection belongs to
+# the loop that opened it, and every Celery task runs in a fresh loop
+# (``app.tasks.campaigns._run_async``) that is closed afterwards — so a
+# process-wide client served the second task a pool bound to a closed loop,
+# ``INCR`` failed with "Event loop is closed", and the cross-worker daily cap
+# silently degraded to each worker counting rows on its own.
 _redis = None
+_redis_loop = None
 _redis_disabled = False
 
 
 async def _get_redis():
-    global _redis, _redis_disabled
+    global _redis, _redis_loop, _redis_disabled
     if _redis_disabled:
         return None
-    if _redis is not None:
+    loop = asyncio.get_running_loop()
+    if _redis is not None and _redis_loop is loop:
         return _redis
+    # A client from a previous (now closed) loop can't be closed from here;
+    # dropping the reference is all there is to do.
+    _redis, _redis_loop = None, None
     try:
         import redis.asyncio as aioredis
 
@@ -77,6 +90,7 @@ async def _get_redis():
             socket_connect_timeout=0.5,
             socket_timeout=0.5,
         )
+        _redis_loop = loop
         return _redis
     except Exception as exc:  # noqa: BLE001 — any redis failure → DB-count fallback
         logger.info("Send-limit redis unavailable, falling back to row counts: %s", exc)
@@ -86,8 +100,9 @@ async def _get_redis():
 
 def _reset_redis_for_tests() -> None:
     """Drop the cached client so a test can swap in its own fake."""
-    global _redis, _redis_disabled
+    global _redis, _redis_loop, _redis_disabled
     _redis = None
+    _redis_loop = None
     _redis_disabled = False
 
 

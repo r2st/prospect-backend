@@ -709,22 +709,22 @@ Return ONLY valid JSON: {{"subject": "...", "body": "...", "changes_made": "..."
             logger.error("AI email improvement failed: %s", str(e))
             return {"error": str(e)}
 
-    async def score_lead(
-        self,
+    @staticmethod
+    def lead_score_prompt(
         company_name: str,
         industry: str,
         employee_count: Optional[int],
         location: str,
         engagement_history: str = "",
         notes: str = "",
-    ) -> dict:
-        """Use Claude to intelligently score a lead."""
-        try:
-            emp_str = str(employee_count) if employee_count else "Unknown"
-            eng_str = engagement_history if engagement_history else "None yet"
-            notes_str = notes if notes else "None"
+    ) -> str:
+        """The lead-scoring prompt, shared with the per-org fallback in
+        ``app.tasks.enrichment`` so both paths ask the model the same thing."""
+        emp_str = str(employee_count) if employee_count else "Unknown"
+        eng_str = engagement_history if engagement_history else "None yet"
+        notes_str = notes if notes else "None"
 
-            prompt = f"""Score this B2B lead on a scale of 1-100 and explain why.
+        prompt = f"""Score this B2B lead on a scale of 1-100 and explain why.
 
 Company: {company_name}
 Industry: {industry}
@@ -748,6 +748,22 @@ Scoring criteria:
 - Title/role fit of contacts
 
 Return ONLY valid JSON: {{"score": 75, "grade": "A/B/C/D/F", "reasoning": "...", "recommended_action": "...", "priority": "high/medium/low"}}"""
+        return prompt
+
+    async def score_lead(
+        self,
+        company_name: str,
+        industry: str,
+        employee_count: Optional[int],
+        location: str,
+        engagement_history: str = "",
+        notes: str = "",
+    ) -> dict:
+        """Use Claude to intelligently score a lead."""
+        try:
+            prompt = self.lead_score_prompt(
+                company_name, industry, employee_count, location, engagement_history, notes
+            )
 
             response_text = await self._chat(prompt, max_tokens=512)
             result = self._parse_json_response(response_text)
