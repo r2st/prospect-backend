@@ -1219,6 +1219,21 @@ DRAFT_SYSTEM = (
     "Answer with a single JSON object and nothing else."
 )
 
+# Used instead of DRAFT_SYSTEM when a template is given. DRAFT_SYSTEM asks for
+# "short" emails with no attachments mentioned, which fights a template that is
+# long and says "I've attached our brief" — the model sided with the system
+# prompt and rewrote the template into a different email.
+TEMPLATE_DRAFT_SYSTEM = (
+    "You personalise an operator's own email template for one prospect. The template is "
+    "the email: keep its subject line, greeting, every paragraph in the same order, its "
+    "wording, length, offer, call to action, sign-off and signature block. Change only "
+    "what is specific to the prospect: fill the merge fields, and where the template "
+    "talks about the prospect's company, make that sentence accurate for them using "
+    "only the facts given. Do not add, remove, merge or shorten paragraphs. Plain text, "
+    "no markdown, no placeholders like [Name]. Never invent facts about the prospect. "
+    "Answer with a single JSON object and nothing else."
+)
+
 _PLACEHOLDER = re.compile(r"\[[^\]]{2,40}\]|\{\{|\}\}|<[A-Z][A-Z _]{2,}>")
 
 
@@ -1253,6 +1268,15 @@ def draft_prompt(campaign: Campaign, contact: Optional[Contact], company: Option
             "fields; never leave one in the output.\n"
             f"Template subject: {template.subject}\nTemplate body:\n{html_to_text(template.body)}"
         )
+        lines.append("")
+        lines.append(
+            "Return the template as the email: same subject (merge fields filled), same "
+            "greeting, same paragraphs in the same order and the same sign-off and signature. "
+            "Only adjust the sentences that refer to the prospect or their company. The result "
+            "should be about as long as the template, not a shorter rewrite.\n\n"
+            "Return: {\"subject\": str, \"body\": str}"
+        )
+        return "\n".join(lines)
     lines.append("")
     lines.append(
         "Write a first-touch cold email: 60-120 words, a subject under 8 words, open with "
@@ -1425,13 +1449,25 @@ async def write_draft(
         # The operator's own wording: filled in, not rewritten. No AI call.
         subject, body = render_template_draft(template, contact, company)
         return " ".join(subject.split())[:150], body[:4000]
+    use_template = template is not None and mode != "ai"
     draft = await org_gemini.generate_json(
-        db, campaign.org_id, system=DRAFT_SYSTEM,
+        db, campaign.org_id,
+        system=TEMPLATE_DRAFT_SYSTEM if use_template else DRAFT_SYSTEM,
         prompt=draft_prompt(campaign, contact, company, sender_name, sender_org,
-                            template=template if mode != "ai" else None),
-        schema=DraftEmail, max_tokens=2048, temperature=0.6,
+                            template=template if use_template else None),
+        schema=DraftEmail, max_tokens=2048, temperature=0.3 if use_template else 0.6,
     )
-    return " ".join(draft.subject.split())[:150], draft.body.strip()[:4000]
+    subject, body = " ".join(draft.subject.split())[:150], draft.body.strip()[:4000]
+    if use_template:
+        # Guard: a personalised template must still read as the template. If the
+        # model collapsed it into a much shorter email, use the merge-filled
+        # template itself rather than ship something the operator never wrote.
+        base_subject, base_body = render_template_draft(template, contact, company)
+        if len(body) < 0.7 * len(base_body):
+            logger.warning("AI rewrite of template %s was %d/%d chars; using the template as written",
+                           template.id, len(body), len(base_body))
+            return " ".join(base_subject.split())[:150], base_body[:4000]
+    return subject, body
 
 
 async def redraft_prospect(

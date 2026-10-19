@@ -509,3 +509,39 @@ async def test_picking_a_template_alone_switches_drafting_to_it(client, db_sessi
     await client.patch(url, json={"template_id": str(t.id), "template_mode": "template"})
     await db_session.refresh(c)
     assert (await svc.campaign_template(db_session, c)).id == t.id
+
+
+@pytest.mark.asyncio
+async def test_ai_template_prompt_makes_the_template_the_email(db_session, monkeypatch):
+    t = await _template(db_session)
+    c = await _campaign(db_session, template_id=t.id, template_mode="ai_template")
+    await _prospect(db_session, c)
+    seen = {}
+
+    async def fake_json(db, org_id, *, prompt, schema, system=None, **kw):
+        seen.update(prompt=prompt, system=system)
+        return schema(subject="S", body="B")
+
+    monkeypatch.setattr(org_gemini, "generate_json", fake_json)
+    await svc.generate_drafts(db_session, c, MIDWEEK)
+    # The cold-email brief ("60-120 words, subject under 8 words") must not
+    # compete with the template, and the system prompt must not forbid its length.
+    assert "60-120 words" not in seen["prompt"]
+    assert "same paragraphs in the same order" in seen["prompt"]
+    assert seen["system"] == svc.TEMPLATE_DRAFT_SYSTEM
+
+
+@pytest.mark.asyncio
+async def test_a_collapsed_ai_rewrite_falls_back_to_the_template_as_written(db_session, monkeypatch):
+    t = await _template(db_session)
+    c = await _campaign(db_session, template_id=t.id, template_mode="ai_template")
+    p = await _prospect(db_session, c)
+
+    async def fake_json(db, org_id, *, prompt, schema, **kw):
+        return schema(subject="Different subject", body="Tiny rewrite.")
+
+    monkeypatch.setattr(org_gemini, "generate_json", fake_json)
+    await svc.generate_drafts(db_session, c, MIDWEEK)
+    await db_session.refresh(p)
+    assert p.email_subject != "Different subject"
+    assert p.email_body != "Tiny rewrite."
