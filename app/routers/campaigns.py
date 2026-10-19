@@ -209,6 +209,26 @@ class BulkApproveOut(BaseModel):
     instant_send: Optional[str] = None
 
 
+class SendNowIn(BaseModel):
+    prospect_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=10)
+
+
+class SendNowResult(BaseModel):
+    id: uuid.UUID
+    # "sent", or why not: "held" (daily/warm-up cap, mailbox, unverified
+    # address — stays approved and goes out later), "skipped", "failed",
+    # "campaign_inactive", "not_sendable" (not a draft / no draft yet).
+    outcome: str
+    detail: Optional[str] = None
+    status: str
+    to_email: Optional[str] = None
+
+
+class SendNowOut(BaseModel):
+    results: list[SendNowResult]
+    sent: int
+
+
 class SkipIn(BaseModel):
     reason: Optional[str] = Field(None, max_length=500)
 
@@ -945,6 +965,83 @@ async def bulk_approve_prospects(
         else:
             out.instant_send = _dispatch_instant_send(c)
     return out
+
+
+async def _send_now(db: AsyncSession, c: Campaign, p: CampaignProspect) -> SendNowResult:
+    """Approve one draft and put it on the wire in this request.
+
+    ``svc.send_prospect`` is the same last gate the worker uses — kill switch,
+    do-not-contact, verified address, never-twice, the warm-up/daily cap — so
+    "now" skips only the wait for the queue and the send window, not a check.
+    """
+    def result(outcome: str, detail: Optional[str] = None) -> SendNowResult:
+        return SendNowResult(id=p.id, outcome=outcome, detail=detail, status=p.status, to_email=p.to_email)
+
+    if p.status not in ("draft_created", "approved"):
+        return result("not_sendable", f"It is '{p.status}', not a draft.")
+    if not p.email_subject or not p.email_body:
+        return result("not_sendable", "There is no draft to send yet.")
+    if p.status == "draft_created":
+        p.status = "approved"
+        p.approved_at = p.approved_at or datetime.now(timezone.utc)
+        p.error = None
+        await db.commit()
+    outcome = await svc.send_prospect(db, p.id)
+    await db.refresh(p)
+    return result(outcome.status, outcome.detail)
+
+
+def _require_active_to_send(c: Campaign) -> None:
+    # send_prospect refuses an inactive campaign anyway; saying so up front
+    # avoids approving the draft as a side effect of a send that can't happen.
+    if c.status != "active" or c.deleted_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Resume the campaign to send emails.")
+
+
+@router.post("/{campaign_id}/prospects/{prospect_id}/send-now", response_model=SendNowResult)
+async def send_prospect_now(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approve this draft and send it right away, not at the next tick."""
+    c = await _get_campaign(db, campaign_id, user)
+    _require_active_to_send(c)
+    p = await _get_prospect(db, c, prospect_id)
+    return await _send_now(db, c, p)
+
+
+@router.post("/{campaign_id}/prospects/send-now", response_model=SendNowOut)
+async def send_prospects_now(
+    campaign_id: uuid.UUID,
+    payload: SendNowIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Send the selected drafts now, one after another, up to 10 per request.
+
+    The cap keeps an inline burst short: each send is a round trip to the
+    mailbox provider, and a larger batch belongs on the paced queue (approve).
+    """
+    c = await _get_campaign(db, campaign_id, user)
+    _require_active_to_send(c)
+    rows = (
+        await db.execute(
+            select(CampaignProspect).where(
+                CampaignProspect.campaign_id == c.id, CampaignProspect.id.in_(payload.prospect_ids)
+            )
+        )
+    ).scalars().all()
+    by_id = {p.id: p for p in rows}
+    results = []
+    for pid in dict.fromkeys(payload.prospect_ids):  # keep the caller's order, drop repeats
+        p = by_id.get(pid)
+        if p is None:
+            results.append(SendNowResult(id=pid, outcome="not_sendable", detail="Not in this campaign.", status="unknown"))
+            continue
+        results.append(await _send_now(db, c, p))
+    return SendNowOut(results=results, sent=sum(r.outcome == "sent" for r in results))
 
 
 @router.post("/{campaign_id}/prospects/{prospect_id}/skip", response_model=ProspectOut)

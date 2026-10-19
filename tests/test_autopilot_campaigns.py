@@ -260,6 +260,68 @@ async def test_bulk_approve_selected_ignores_verification_and_other_rows(client,
     assert picked.status == "approved" and left.status == "draft_created" and sent.status == "sent"
 
 
+@pytest.mark.asyncio
+async def test_send_now_approves_and_sends_in_the_request(client, db_session, monkeypatch):
+    c = await _campaign(db_session, review_before_send=True)
+    ct = await _contact(db_session, "now@acme.com", verified=True)
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="now@acme.com",
+                         status="draft_created", email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    seen = {}
+
+    async def fake_send(db, **kw):
+        seen.update(kw)
+        return {"status": "sent", "gmail_message_id": "m1", "gmail_thread_id": "t1"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/send-now")
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "sent" and r.json()["status"] == "sent"
+    assert seen["to_email"] == "now@acme.com" and seen["plain_text"] is True
+    await db_session.refresh(p)
+    assert p.status == "sent" and p.approved_at is not None and p.email_send_id is not None
+
+    # Already sent: nothing to do, and never twice.
+    again = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/send-now")
+    assert again.json()["outcome"] == "not_sendable"
+
+
+@pytest.mark.asyncio
+async def test_send_now_keeps_the_last_gate(client, db_session, monkeypatch):
+    c = await _campaign(db_session, review_before_send=True)
+    ct = await _contact(db_session, "maybe@acme.com")  # not verified
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="maybe@acme.com",
+                         status="draft_created", email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+
+    async def must_not_send(db, **kw):
+        raise AssertionError("an unverified address went on the wire")
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", must_not_send)
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/send-now",
+                          json={"prospect_ids": [str(p.id), str(uuid.uuid4())]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sent"] == 0
+    assert [x["outcome"] for x in body["results"]] == ["held", "not_sendable"]
+    assert body["results"][0]["detail"] == "email not verified yet"
+
+
+@pytest.mark.asyncio
+async def test_send_now_refuses_a_paused_campaign_without_approving(client, db_session):
+    c = await _campaign(db_session, status="paused")
+    p = CampaignProspect(campaign_id=c.id, to_email="x@acme.com", status="draft_created",
+                         email_subject="Hi", email_body="Hello")
+    db_session.add(p)
+    await db_session.commit()
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/send-now")
+    assert r.status_code == 409
+    await db_session.refresh(p)
+    assert p.status == "draft_created"
+
+
 # ── dedup ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
