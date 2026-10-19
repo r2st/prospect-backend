@@ -11,7 +11,7 @@ import logging
 import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr
+from email.utils import formataddr, formatdate, make_msgid
 from typing import Optional, Sequence
 
 from app.services import crypto
@@ -105,6 +105,11 @@ class SmtpSender:
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
+        # Gmail's API and SES stamp these themselves; an SMTP relay may not, and
+        # mail with no Message-ID or Date is a classic spam-filter strike. The
+        # id uses the sender's own domain so it matches the From address.
+        message["Date"] = formatdate(usegmt=True)
+        message["Message-ID"] = make_msgid(domain=self.sender_email.rsplit("@", 1)[-1] or None)
         if reply_to:
             message["Reply-To"] = reply_to
         # Threading headers so replies thread correctly in the recipient's client.
@@ -154,6 +159,8 @@ class SmtpSender:
                 "status": "sent",
                 "transport": "smtp",
                 "sender": self.sender_email,
+                # Ours, so a reply's In-Reply-To can be matched to this send.
+                "message_id": message["Message-ID"],
             }
         except Exception as e:
             logger.error("Failed to send SMTP email to %s as %s: %s", to_email, self.sender_email, e)

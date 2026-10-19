@@ -213,11 +213,18 @@ class SendNowIn(BaseModel):
     prospect_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=10)
 
 
+class ComposeSendIn(BaseModel):
+    """An email written (or rewritten) by hand for one prospect."""
+    email_subject: str = Field(..., min_length=1, max_length=150)
+    email_body: str = Field(..., min_length=1, max_length=4000)
+
+
 class SendNowResult(BaseModel):
     id: uuid.UUID
-    # "sent", or why not: "held" (daily/warm-up cap, mailbox, unverified
-    # address — stays approved and goes out later), "skipped", "failed",
-    # "campaign_inactive", "not_sendable" (not a draft / no draft yet).
+    # "sent", or why not: "held" (daily/warm-up cap, mailbox pacing, unverified
+    # address — stays approved and goes out later), "queued" (approved and
+    # handed to the paced queue), "skipped", "failed", "campaign_inactive",
+    # "not_sendable" (not a draft / no draft yet).
     outcome: str
     detail: Optional[str] = None
     status: str
@@ -227,6 +234,7 @@ class SendNowResult(BaseModel):
 class SendNowOut(BaseModel):
     results: list[SendNowResult]
     sent: int
+    queued: int = 0
 
 
 class SkipIn(BaseModel):
@@ -967,6 +975,22 @@ async def bulk_approve_prospects(
     return out
 
 
+# A queued prospect has no draft yet, but a hand-written email gives it one.
+_SENDABLE = ("draft_created", "approved")
+
+
+async def _approve_for_send(db: AsyncSession, p: CampaignProspect) -> bool:
+    """Approve a draft (no-op if already approved). False if there is nothing to send."""
+    if p.status not in _SENDABLE or not p.email_subject or not p.email_body:
+        return False
+    if p.status == "draft_created":
+        p.status = "approved"
+        p.approved_at = p.approved_at or datetime.now(timezone.utc)
+        p.error = None
+        await db.commit()
+    return True
+
+
 async def _send_now(db: AsyncSession, c: Campaign, p: CampaignProspect) -> SendNowResult:
     """Approve one draft and put it on the wire in this request.
 
@@ -977,15 +1001,11 @@ async def _send_now(db: AsyncSession, c: Campaign, p: CampaignProspect) -> SendN
     def result(outcome: str, detail: Optional[str] = None) -> SendNowResult:
         return SendNowResult(id=p.id, outcome=outcome, detail=detail, status=p.status, to_email=p.to_email)
 
-    if p.status not in ("draft_created", "approved"):
-        return result("not_sendable", f"It is '{p.status}', not a draft.")
-    if not p.email_subject or not p.email_body:
-        return result("not_sendable", "There is no draft to send yet.")
-    if p.status == "draft_created":
-        p.status = "approved"
-        p.approved_at = p.approved_at or datetime.now(timezone.utc)
-        p.error = None
-        await db.commit()
+    if not await _approve_for_send(db, p):
+        return result(
+            "not_sendable",
+            f"It is '{p.status}', not a draft." if p.status not in _SENDABLE else "There is no draft to send yet.",
+        )
     outcome = await svc.send_prospect(db, p.id)
     await db.refresh(p)
     return result(outcome.status, outcome.detail)
@@ -1012,6 +1032,35 @@ async def send_prospect_now(
     return await _send_now(db, c, p)
 
 
+@router.post("/{campaign_id}/prospects/{prospect_id}/compose-send", response_model=SendNowResult)
+async def compose_and_send_prospect(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: ComposeSendIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Send an email written by hand to this prospect, right away.
+
+    The text replaces the draft (or becomes the first one, for a prospect still
+    queued) and is sent through the same last gate as every campaign email —
+    plain text, footer, List-Unsubscribe, verified-only, never twice, warm-up,
+    daily cap and mailbox pacing.
+    """
+    c = await _get_campaign(db, campaign_id, user)
+    _require_active_to_send(c)
+    p = await _get_prospect(db, c, prospect_id)
+    if p.status not in ("queued", *_SENDABLE):
+        return SendNowResult(id=p.id, outcome="not_sendable", detail=f"It is '{p.status}'.",
+                             status=p.status, to_email=p.to_email)
+    p.email_subject = " ".join(payload.email_subject.split())
+    p.email_body = payload.email_body.strip()
+    if p.status == "queued":
+        p.status = "draft_created"
+    await db.commit()
+    return await _send_now(db, c, p)
+
+
 @router.post("/{campaign_id}/prospects/send-now", response_model=SendNowOut)
 async def send_prospects_now(
     campaign_id: uuid.UUID,
@@ -1019,10 +1068,11 @@ async def send_prospects_now(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Send the selected drafts now, one after another, up to 10 per request.
+    """Send the selected drafts now: the first in this request, the rest paced.
 
-    The cap keeps an inline burst short: each send is a round trip to the
-    mailbox provider, and a larger batch belongs on the paced queue (approve).
+    Up to 10 per request. Only the first goes on the wire inline; the others
+    are approved and handed to the queue, which spaces them 60–120s apart under
+    the same warm-up and daily caps.
     """
     c = await _get_campaign(db, campaign_id, user)
     _require_active_to_send(c)
@@ -1035,13 +1085,29 @@ async def send_prospects_now(
     ).scalars().all()
     by_id = {p.id: p for p in rows}
     results = []
+    sent_inline = False
     for pid in dict.fromkeys(payload.prospect_ids):  # keep the caller's order, drop repeats
         p = by_id.get(pid)
         if p is None:
             results.append(SendNowResult(id=pid, outcome="not_sendable", detail="Not in this campaign.", status="unknown"))
             continue
-        results.append(await _send_now(db, c, p))
-    return SendNowOut(results=results, sent=sum(r.outcome == "sent" for r in results))
+        if not sent_inline:
+            r = await _send_now(db, c, p)
+            sent_inline = r.outcome == "sent" or r.outcome == "held"
+            results.append(r)
+            continue
+        # The rest go to the paced queue, 60–120s apart: ten sends in one
+        # second from one mailbox is the burst spam filters look for.
+        if await _approve_for_send(db, p):
+            results.append(SendNowResult(id=p.id, outcome="queued", detail="spaced 1–2 minutes apart",
+                                         status=p.status, to_email=p.to_email))
+        else:
+            results.append(SendNowResult(id=p.id, outcome="not_sendable", detail="There is no draft to send yet.",
+                                         status=p.status, to_email=p.to_email))
+    queued = sum(r.outcome == "queued" for r in results)
+    if queued:
+        _dispatch_instant_send(c)
+    return SendNowOut(results=results, sent=sum(r.outcome == "sent" for r in results), queued=queued)
 
 
 @router.post("/{campaign_id}/prospects/{prospect_id}/skip", response_model=ProspectOut)

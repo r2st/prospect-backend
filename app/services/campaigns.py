@@ -1932,6 +1932,40 @@ async def reap_stuck_sends(db: AsyncSession, now: Optional[datetime] = None) -> 
     return {"reaped": len(rows), "campaigns": len(by_campaign)}
 
 
+# Per-mailbox burst limits, on top of the warm-up ramp and daily cap. The
+# queue already spaces its own sends 60–120s apart; these hold for every path
+# through send_prospect — the queue, "Send now" and a composed email — so a
+# few quick clicks can't put a burst on the wire from one mailbox.
+MAILBOX_MIN_GAP = timedelta(seconds=45)
+MAILBOX_HOURLY_CAP = 30
+
+
+async def mailbox_pacing(db: AsyncSession, account_id: uuid.UUID, now: datetime) -> Optional[str]:
+    """Why this mailbox must wait before its next send, or None if it may send.
+
+    Read from ``EmailSend`` (every campaign and manual send records one, with
+    its mailbox). Sequence sends record only an ``OutreachEvent`` with no
+    mailbox on it, so they count toward the org's daily cap but not here.
+    """
+    recent = (
+        await db.execute(
+            select(func.count(EmailSend.id), func.max(EmailSend.sent_at)).where(
+                EmailSend.sender_account_id == account_id,
+                EmailSend.status.in_(WIRE_STATUSES),
+                EmailSend.sent_at >= now - timedelta(hours=1),
+            )
+        )
+    ).one()
+    count, last = recent
+    if count >= MAILBOX_HOURLY_CAP:
+        return f"this mailbox sent {count} emails in the last hour (limit {MAILBOX_HOURLY_CAP}) — try again later"
+    if last is not None:
+        wait = MAILBOX_MIN_GAP - (now - _aware(last))
+        if wait > timedelta(0):
+            return f"spacing sends from this mailbox — wait {max(1, int(wait.total_seconds()))}s"
+    return None
+
+
 async def send_prospect(
     db: AsyncSession, prospect_id: uuid.UUID, now: Optional[datetime] = None
 ) -> SendOutcome:
@@ -1956,6 +1990,11 @@ async def send_prospect(
         p.scheduled_for = None
         await db.commit()
         return SendOutcome("held", "gmail account unavailable")
+    paced = await mailbox_pacing(db, account.id, now)
+    if paced:
+        p.scheduled_for = None
+        await db.commit()
+        return SendOutcome("held", paced)
     email = (p.to_email or "").lower()
     if not email or not p.email_subject or not p.email_body:
         p.status, p.skip_reason = "skipped", "Nothing to send"

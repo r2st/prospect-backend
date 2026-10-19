@@ -322,6 +322,97 @@ async def test_send_now_refuses_a_paused_campaign_without_approving(client, db_s
     assert p.status == "draft_created"
 
 
+@pytest.mark.asyncio
+async def test_mailbox_pacing_holds_a_send_too_soon_after_the_last(db_session, monkeypatch):
+    c = await _campaign(db_session)
+    ct = await _contact(db_session, "pace@acme.com", verified=True)
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="pace@acme.com",
+                         status="approved", email_subject="Hi", email_body="Hello")
+    db_session.add_all([p, EmailSend(to_email="earlier@beta.com", subject="s", body_html="b", status="sent",
+                                     sent_at=MIDWEEK - timedelta(seconds=10), sender_account_id=c.gmail_account_id)])
+    await db_session.commit()
+
+    async def must_not_send(db, **kw):
+        raise AssertionError("sent inside the mailbox gap")
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", must_not_send)
+    out = await svc.send_prospect(db_session, p.id, MIDWEEK)
+    assert out.status == "held" and "wait 35s" in out.detail
+    await db_session.refresh(p)
+    assert p.status == "approved"  # still goes out, just later
+
+
+@pytest.mark.asyncio
+async def test_mailbox_pacing_caps_sends_per_hour(db_session):
+    c = await _campaign(db_session)
+    db_session.add_all([
+        EmailSend(to_email=f"r{i}@beta.com", subject="s", body_html="b", status="sent",
+                  sent_at=MIDWEEK - timedelta(minutes=50) + timedelta(seconds=i), sender_account_id=c.gmail_account_id)
+        for i in range(svc.MAILBOX_HOURLY_CAP)
+    ])
+    await db_session.commit()
+    why = await svc.mailbox_pacing(db_session, c.gmail_account_id, MIDWEEK)
+    assert why and "in the last hour" in why
+    # An hour on, the window has rolled.
+    assert await svc.mailbox_pacing(db_session, c.gmail_account_id, MIDWEEK + timedelta(hours=1)) is None
+
+
+@pytest.mark.asyncio
+async def test_compose_send_replaces_the_draft_and_sends_it(client, db_session, monkeypatch):
+    c = await _campaign(db_session, review_before_send=True)
+    ct = await _contact(db_session, "write@acme.com", verified=True)
+    p = CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email="write@acme.com", status="queued")
+    db_session.add(p)
+    await db_session.commit()
+    seen = {}
+
+    async def fake_send(db, **kw):
+        seen.update(kw)
+        return {"status": "sent", "gmail_message_id": "m1", "gmail_thread_id": "t1"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/{p.id}/compose-send",
+                          json={"email_subject": "  Quick   note ", "email_body": "Hi there,\n\nShort one."})
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "sent"
+    assert seen["subject"] == "Quick note" and "Short one." in seen["body_html"] and seen["plain_text"] is True
+    await db_session.refresh(p)
+    assert p.status == "sent" and p.email_body == "Hi there,\n\nShort one."
+
+
+@pytest.mark.asyncio
+async def test_send_selected_now_sends_one_and_paces_the_rest(client, db_session, monkeypatch):
+    from app.routers import campaigns as router_mod
+
+    c = await _campaign(db_session, review_before_send=True)
+    rows = []
+    for i in range(3):
+        ct = await _contact(db_session, f"b{i}@acme{i}.com", verified=True)
+        rows.append(CampaignProspect(campaign_id=c.id, contact_id=ct.id, to_email=f"b{i}@acme{i}.com",
+                                     status="draft_created", email_subject="Hi", email_body="Hello"))
+    db_session.add_all(rows)
+    await db_session.commit()
+    sends, dispatched = [], []
+
+    async def fake_send(db, **kw):
+        sends.append(kw["to_email"])
+        return {"status": "sent", "gmail_message_id": f"m{len(sends)}"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", fake_send)
+    monkeypatch.setattr(router_mod, "_dispatch_instant_send", lambda camp: dispatched.append(camp.id) or "dispatched")
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/send-now",
+                          json={"prospect_ids": [str(x.id) for x in rows]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sends == ["b0@acme0.com"]  # one on the wire now, not three in a second
+    assert body["sent"] == 1 and body["queued"] == 2
+    assert [x["outcome"] for x in body["results"]] == ["sent", "queued", "queued"]
+    assert dispatched == [c.id]
+    for x in rows[1:]:
+        await db_session.refresh(x)
+        assert x.status == "approved"
+
+
 # ── dedup ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
