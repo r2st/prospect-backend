@@ -186,6 +186,29 @@ class ApproveIn(BaseModel):
     email_body: Optional[str] = Field(None, min_length=1, max_length=4000)
 
 
+class BulkApproveIn(BaseModel):
+    """Approve many drafts at once.
+
+    ``prospect_ids`` omitted means every draft in the campaign. ``verified_only``
+    leaves drafts whose address isn't verified deliverable as drafts, for a
+    person to look at — the "approve all" button sends it; an explicit selection
+    doesn't, matching the per-row Approve button.
+    """
+    prospect_ids: Optional[list[uuid.UUID]] = Field(None, min_length=1, max_length=500)
+    verified_only: bool = True
+
+
+class BulkApproveOut(BaseModel):
+    approved: int
+    approved_ids: list[uuid.UUID]
+    # Drafts left alone because their address isn't verified deliverable.
+    skipped_unverified: int
+    # Ids that weren't an approvable draft in this campaign (already sent,
+    # skipped, still drafting, another campaign's).
+    skipped_ineligible: int
+    instant_send: Optional[str] = None
+
+
 class SkipIn(BaseModel):
     reason: Optional[str] = Field(None, max_length=500)
 
@@ -864,6 +887,59 @@ async def approve_prospect(
     if c.status == "active":
         # Spam protection is the only thing that holds an approval: with
         # today's warm-up allowance spent, it waits for tomorrow's.
+        if await svc.sent_today(db, c) >= svc.send_cap(c):
+            out.instant_send = "limit_reached"
+        else:
+            out.instant_send = _dispatch_instant_send(c)
+    return out
+
+
+@router.post("/{campaign_id}/prospects/approve", response_model=BulkApproveOut)
+async def bulk_approve_prospects(
+    campaign_id: uuid.UUID,
+    payload: Optional[BulkApproveIn] = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approve drafts in one go: the selected ones, or all of them.
+
+    Only ``draft_created`` rows with a subject and body qualify — the same bar
+    as the single approve, minus its edits. Already-approved rows are not
+    counted again.
+    """
+    payload = payload or BulkApproveIn()
+    c = await _get_campaign(db, campaign_id, user)
+    q = (
+        select(CampaignProspect, Contact.email_verification_result)
+        .outerjoin(Contact, Contact.id == CampaignProspect.contact_id)
+        .where(CampaignProspect.campaign_id == c.id, CampaignProspect.status == "draft_created")
+    )
+    if payload.prospect_ids is not None:
+        q = q.where(CampaignProspect.id.in_(payload.prospect_ids))
+    rows = (await db.execute(q)).all()
+
+    now = datetime.now(timezone.utc)
+    approved: list[uuid.UUID] = []
+    unverified = 0
+    for p, verdict in rows:
+        if not p.email_subject or not p.email_body:
+            continue
+        if payload.verified_only and verdict != svc.VERIFIED:
+            unverified += 1
+            continue
+        p.status = "approved"
+        p.approved_at = p.approved_at or now
+        p.error = None
+        approved.append(p.id)
+    await db.commit()
+
+    considered = len(payload.prospect_ids) if payload.prospect_ids is not None else len(rows)
+    out = BulkApproveOut(
+        approved=len(approved), approved_ids=approved,
+        skipped_unverified=unverified,
+        skipped_ineligible=max(0, considered - len(approved) - unverified),
+    )
+    if approved and c.status == "active":
         if await svc.sent_today(db, c) >= svc.send_cap(c):
             out.instant_send = "limit_reached"
         else:

@@ -211,6 +211,55 @@ async def test_skip_prospect(client, db_session):
     assert again.status_code == 409
 
 
+@pytest.mark.asyncio
+async def test_bulk_approve_all_takes_only_verified_drafts(client, db_session):
+    c = await _campaign(db_session, status="paused", review_before_send=True)
+    good = await _contact(db_session, "good@acme.com", verified=True)
+    risky = await _contact(db_session, "risky@beta.com")
+    p_good = CampaignProspect(campaign_id=c.id, contact_id=good.id, to_email="good@acme.com",
+                              status="draft_created", email_subject="Hi", email_body="Hello")
+    p_risky = CampaignProspect(campaign_id=c.id, contact_id=risky.id, to_email="risky@beta.com",
+                               status="draft_created", email_subject="Hi", email_body="Hello")
+    p_queued = CampaignProspect(campaign_id=c.id, to_email="q@acme.com", status="queued")
+    db_session.add_all([p_good, p_risky, p_queued])
+    await db_session.commit()
+
+    r = await client.post(f"/api/v1/campaigns/{c.id}/prospects/approve", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["approved"] == 1 and body["approved_ids"] == [str(p_good.id)]
+    assert body["skipped_unverified"] == 1
+    for row in (p_good, p_risky, p_queued):
+        await db_session.refresh(row)
+    assert p_good.status == "approved" and p_good.approved_at is not None
+    assert p_risky.status == "draft_created" and p_queued.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_selected_ignores_verification_and_other_rows(client, db_session):
+    c = await _campaign(db_session, status="paused", review_before_send=True)
+    risky = await _contact(db_session, "risky@beta.com")
+    picked = CampaignProspect(campaign_id=c.id, contact_id=risky.id, to_email="risky@beta.com",
+                              status="draft_created", email_subject="Hi", email_body="Hello")
+    left = CampaignProspect(campaign_id=c.id, to_email="left@acme.com",
+                            status="draft_created", email_subject="Hi", email_body="Hello")
+    sent = CampaignProspect(campaign_id=c.id, to_email="sent@acme.com", status="sent",
+                            email_subject="Hi", email_body="Hello")
+    db_session.add_all([picked, left, sent])
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/campaigns/{c.id}/prospects/approve",
+        json={"prospect_ids": [str(picked.id), str(sent.id), str(uuid.uuid4())], "verified_only": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["approved"] == 1 and body["skipped_ineligible"] == 2
+    for row in (picked, left, sent):
+        await db_session.refresh(row)
+    assert picked.status == "approved" and left.status == "draft_created" and sent.status == "sent"
+
+
 # ── dedup ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
