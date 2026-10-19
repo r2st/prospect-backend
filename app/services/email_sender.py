@@ -123,10 +123,9 @@ class EmailSender:
         no-URL call, and the fallback when the deployed IAM identity turns out
         not to be allowed to send raw.
         """
-        message = {
-            "Subject": {"Data": subject, "Charset": "UTF-8"},
-            "Body": {"Html": {"Data": body_html, "Charset": "UTF-8"}},
-        }
+        message = {"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": {}}
+        if body_html:
+            message["Body"]["Html"] = {"Data": body_html, "Charset": "UTF-8"}
         if body_text:
             message["Body"]["Text"] = {"Data": body_text, "Charset": "UTF-8"}
         return self.client.send_email(
@@ -186,7 +185,8 @@ class EmailSender:
             footer = self._build_unsubscribe_footer(to_email)
             if body_text:
                 body_text += footer
-            body_html += footer.replace("\n", "<br>")
+            if body_html:
+                body_html += footer.replace("\n", "<br>")
 
         try:
             if attachments:

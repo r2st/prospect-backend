@@ -724,6 +724,7 @@ async def send_outreach_email(
     skip_spam_scan: bool = False,
     daily_slot_reserved: bool = False,
     attachments: Optional[Sequence[OutgoingAttachment]] = None,
+    plain_text: bool = False,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
@@ -749,6 +750,10 @@ async def send_outreach_email(
     function walked past it one contact at a time. ``daily_slot_reserved=True``
     is for the queue, which claims its own slot earlier so it can release it
     alongside the send claim and the pacing window.
+
+    ``plain_text=True`` sends a single ``text/plain`` body and no HTML part.
+    ``body_html`` is still what is scanned and what the signature and footer are
+    appended to; it is flattened to text instead of wrapped in a document.
 
     ``attachments`` are sent as-is on every transport. They are passed to the
     transport only when present, so a sender that predates them (or a test
@@ -839,8 +844,9 @@ async def send_outreach_email(
     if include_unsubscribe:
         body_text = body_text + _unsubscribe_footer_text(to_email)
 
-    # Wrap in a complete HTML email document with inline styles
-    body_html = wrap_html_email(body_html)
+    # Wrap in a complete HTML email document with inline styles — or, for a
+    # plain-text send, drop the HTML part altogether.
+    body_html = "" if plain_text else wrap_html_email(body_html)
 
     extra = {"attachments": list(attachments)} if attachments else {}
 

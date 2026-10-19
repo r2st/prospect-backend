@@ -289,6 +289,7 @@ async def test_send_prospect_goes_through_the_dispatcher_and_records_the_send(db
     out = await svc.send_prospect(db_session, p.id, MIDWEEK)
     assert out.status == "sent"
     assert seen["to_email"] == "ok@acme.com" and seen["sender_account_id"] == c.gmail_account_id
+    assert seen["plain_text"] is True
     await db_session.refresh(p)
     assert p.status == "sent" and p.gmail_thread_id == "t1" and p.email_send_id is not None
     log = (await db_session.execute(select(CampaignDailyLog))).scalars().first()

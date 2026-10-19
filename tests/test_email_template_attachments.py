@@ -378,6 +378,15 @@ def test_no_attachments_keeps_the_plain_alternative_body():
     assert _parts(msg) == ["text/plain", "text/html"]
 
 
+def test_no_html_sends_a_single_plain_text_part():
+    msg = ta.build_mime_body("Hello there", "")
+    assert msg.get_content_type() == "text/plain"
+    assert msg.get_payload(decode=True).decode() == "Hello there"
+
+    with_file = ta.build_mime_body("Hello", None, [ta.OutgoingAttachment("deck.pdf", "application/pdf", PDF)])
+    assert _parts(with_file) == ["text/plain", "application/pdf"]
+
+
 def test_attachments_wrap_the_body_in_multipart_mixed():
     files = [
         ta.OutgoingAttachment("deck.pdf", "application/pdf", PDF),

@@ -166,12 +166,17 @@ def build_mime_body(
     """The message container every transport sets its headers on.
 
     Plain text precedes HTML inside the alternative part (RFC 2046: clients
-    render the *last* part they understand).
+    render the *last* part they understand). With no ``body_html`` the body is a
+    single ``text/plain`` part — a plain-text email, with no HTML for a client
+    to render instead.
     """
-    alternative = MIMEMultipart("alternative")
-    if body_text:
-        alternative.attach(MIMEText(body_text, "plain", "utf-8"))
-    alternative.attach(MIMEText(body_html, "html", "utf-8"))
+    if body_html:
+        alternative = MIMEMultipart("alternative")
+        if body_text:
+            alternative.attach(MIMEText(body_text, "plain", "utf-8"))
+        alternative.attach(MIMEText(body_html, "html", "utf-8"))
+    else:
+        alternative = MIMEText(body_text or "", "plain", "utf-8")
 
     files = list(attachments or ())
     if not files:

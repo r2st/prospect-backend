@@ -2020,6 +2020,9 @@ async def send_prospect(
             body_html=body_to_html(p.email_body),
             sender_account_id=account.id,
             attachments=await _attachments(db, campaign) or None,
+            # Drafts are written as plain prose; an HTML rendering of them only
+            # gave mail clients something to mangle.
+            plain_text=True,
         )
     except Exception as exc:  # noqa: BLE001
         # The transport may have accepted the message before this raised, so a
