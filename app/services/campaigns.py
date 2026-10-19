@@ -1154,10 +1154,11 @@ async def discover_prospects(
 # campaign has fewer prospects in hand than it can send in a day. A day whose
 # search came back mostly undeliverable or email-less used to sit idle until
 # tomorrow ("it is not searching more contacts").
-AUTO_DISCOVERY_RUNS = 3
+AUTO_DISCOVERY_RUNS = 10
 DISCOVERY_TOPUP_GAP = timedelta(hours=2)
 # Including the operator's "Find more prospects" — each search spends AI quota.
-MANUAL_DISCOVERY_RUNS = 6
+# Kept above AUTO_DISCOVERY_RUNS so the button still works after the tick's own runs.
+MANUAL_DISCOVERY_RUNS = 13
 
 
 async def discovery_due(db: AsyncSession, campaign: Campaign, now: Optional[datetime] = None) -> bool:
