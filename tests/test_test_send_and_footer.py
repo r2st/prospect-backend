@@ -24,10 +24,53 @@ def test_footer_is_unsubscribe_and_powered_by_only():
         assert "unsubscribe" in footer.lower()
         assert "Powered by DoAide Prospect" in footer
         assert "https://prospect.doaide.com" in footer
-        assert "DoAide · Bangalore, India" in footer
+        assert "Bangalore" not in footer
         assert settings.company_postal_address not in footer
         assert settings.company_name not in footer
     assert '<a href="https://prospect.doaide.com"' in html
+
+
+@pytest.mark.asyncio
+async def test_sent_email_carries_the_footer_exactly_once(db_session: AsyncSession, monkeypatch):
+    """The text part was built from the HTML *after* the HTML footer went in,
+    then the text footer was appended too — every text/plain part had the
+    unsubscribe block twice (seen in a real send that landed in spam)."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.models.gmail_account import GmailAccount
+    from app.services import email_dispatch
+
+    account = GmailAccount(
+        id=uuid.uuid4(), email="rep@example.com", google_sub=str(uuid.uuid4()),
+        display_name="Rep", refresh_token_encrypted="x", status="connected",
+        sending_enabled=True, connected_at=datetime.now(timezone.utc),
+    )
+    db_session.add(account)
+    await db_session.flush()
+
+    sent = []
+
+    class _Transport:
+        def send_email(self, **kwargs):
+            sent.append(kwargs)
+            return {"status": "sent", "transport": "gmail", "sender": account.email}
+
+    monkeypatch.setattr(email_dispatch, "_make_sender", lambda a: _Transport())
+    await email_dispatch.send_outreach_email(
+        db_session, to_email="prospect@example.com", subject="Hi",
+        body_html="<p>Hello there.</p>", bypass_kill_switch=True,
+    )
+
+    (call,) = sent
+    for part in (call["body_text"], call["body_html"]):
+        assert part.count("Reply UNSUBSCRIBE") == 1
+        assert part.count("Powered by DoAide Prospect") == 1
+        assert "Bangalore" not in part
+    assert call["body_text"].rstrip().endswith(
+        "Powered by DoAide Prospect — https://prospect.doaide.com"
+    )
+    assert call["list_unsubscribe_url"] in call["body_text"]
 
 
 # --- Test-send endpoint ---

@@ -368,9 +368,6 @@ async def resolve_sender_info(
 
 
 POWERED_BY_URL = "https://prospect.doaide.com"
-# Sender identity line for CAN-SPAM/CASL, which require a physical address on
-# commercial mail. Kept to one short line under the unsubscribe link.
-SENDER_ADDRESS_LINE = "DoAide · Bangalore, India"
 
 
 def _make_unsubscribe_url(contact_email: str) -> str:
@@ -396,23 +393,23 @@ def _unsubscribe_footer_text(contact_email: str) -> str:
         "\n\n—\n"
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        f"{SENDER_ADDRESS_LINE}\n"
         f"Powered by DoAide Prospect — {POWERED_BY_URL}"
     )
 
 
 def _unsubscribe_footer_html(contact_email: str) -> str:
-    """HTML unsubscribe footer with proper inline styles."""
-    unsubscribe_url = _make_unsubscribe_url(contact_email)
+    """HTML unsubscribe footer with proper inline styles.
+
+    Same three lines as :func:`_unsubscribe_footer_text`, so the HTML and
+    plain-text parts say the same thing.
+    """
+    unsubscribe_url = html_mod.escape(_make_unsubscribe_url(contact_email), quote=True)
     return (
-        '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0 12px 0">'
-        '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
-        'Don\'t want these emails? Reply UNSUBSCRIBE or '
-        f'<a href="{unsubscribe_url}" style="color:#9ca3af">unsubscribe here</a></p>'
-        '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
-        f'{html_mod.escape(SENDER_ADDRESS_LINE)}</p>'
-        '<p style="margin:0;font-size:11px;color:#9ca3af">'
-        f'<a href="{POWERED_BY_URL}" style="color:#9ca3af">Powered by DoAide Prospect</a></p>'
+        '<p style="margin:24px 0 0 0;font-size:12px;color:#6b7280">—<br>'
+        'Don\'t want these emails? Reply UNSUBSCRIBE or click: '
+        f'<a href="{unsubscribe_url}" style="color:#6b7280">unsubscribe</a><br>'
+        f'Powered by DoAide Prospect — <a href="{POWERED_BY_URL}" style="color:#6b7280">'
+        f'{POWERED_BY_URL}</a></p>'
     )
 
 
@@ -832,16 +829,17 @@ async def send_outreach_email(
     if signature is not None and signature.content_html:
         body_html = body_html + "<br><br>" + signature.content_html
 
-    # Build the unsubscribe URL once — used for both footer and headers
+    # Auto-generate clean plain text from HTML (never send HTML in text/plain).
+    # This must happen *before* the HTML footer is appended: converting after
+    # turned the HTML footer into text and then appended the text footer too,
+    # so every text/plain part carried the unsubscribe block twice.
+    body_text = _html_to_plain_text(body_html)
+
+    # Build the unsubscribe URL once — used for both footers and the headers
     unsubscribe_url = None
     if include_unsubscribe:
         unsubscribe_url = _make_unsubscribe_url(to_email)
-        footer_html = _unsubscribe_footer_html(to_email)
-        body_html = body_html + footer_html
-
-    # Auto-generate clean plain text from HTML (never send HTML in text/plain)
-    body_text = _html_to_plain_text(body_html)
-    if include_unsubscribe:
+        body_html = body_html + _unsubscribe_footer_html(to_email)
         body_text = body_text + _unsubscribe_footer_text(to_email)
 
     # Wrap in a complete HTML email document with inline styles — or, for a
