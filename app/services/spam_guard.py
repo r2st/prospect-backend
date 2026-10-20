@@ -27,6 +27,15 @@ The scoring itself is deliberately the *deterministic* heuristic, never the AI
 one: this runs on every send, must not cost an LLM call, and must return the
 same verdict for the same copy every time. Nothing here raises — a scanner bug
 must never stop the mail.
+
+**Jev second opinion** (:func:`scan_async`). The send paths call the async
+variant, which runs the same heuristic and then asks TypeSafe's Jev for a
+yes/no spam probability. Jev can only make a verdict *stricter*: a probability
+at ``jev_spam_flag_threshold`` turns a pass into a flag, and one at
+``jev_spam_block_threshold`` blocks — but only when ``spam_guard_block_enabled``
+is on, the same switch that governs heuristic blocking. With no
+``TYPESAFE_API_KEY``, or Jev failing, :func:`scan_async` returns exactly what
+:func:`scan` would. Jev isn't asked about copy the heuristic already blocked.
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.config import get_settings
+from app.services import jev_service
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +69,8 @@ class SpamVerdict:
     allowed: bool = True
     # Set when scanning itself failed; the send is always allowed in that case.
     error: Optional[str] = None
+    # Jev's spam probability (0-1), when it was asked. None = not asked / no answer.
+    jev_spam_probability: Optional[float] = None
 
     @property
     def flagged(self) -> bool:
@@ -71,12 +83,15 @@ class SpamVerdict:
         ``score: 0`` onto every clean send would triple the metadata volume for
         no signal.
         """
-        return {
+        meta = {
             "verdict": self.verdict,
             "score": self.score,
             "risk": self.risk,
             "issues": self.issues[:6],
         }
+        if self.jev_spam_probability is not None:
+            meta["jev_spam_probability"] = round(self.jev_spam_probability, 4)
+        return meta
 
     def reason(self) -> str:
         detail = "; ".join(self.issues[:3]) or "no specific trigger"
@@ -152,4 +167,67 @@ def scan_for_send(
 ) -> tuple[bool, SpamVerdict]:
     """``scan`` in the shape a send path wants: ``(may_send, verdict)``."""
     verdict = scan(subject, body, has_unsubscribe=has_unsubscribe)
+    return verdict.allowed, verdict
+
+
+def _plain_text(body: str) -> str:
+    """Visible text of an HTML body — what a reader (and Jev) judges."""
+    try:
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(body or "", "html.parser").get_text(" ", strip=True)
+    except Exception:  # noqa: BLE001
+        return body or ""
+
+
+async def scan_async(
+    subject: str,
+    body: str,
+    *,
+    has_unsubscribe: bool = True,
+) -> SpamVerdict:
+    """:func:`scan`, then Jev's spam probability as a second opinion.
+
+    Jev can only tighten the verdict (pass → flag, → block when blocking is
+    enabled), never loosen it. Never raises; any Jev problem leaves the
+    heuristic verdict as it was.
+    """
+    verdict = scan(subject, body, has_unsubscribe=has_unsubscribe)
+    s = get_settings()
+    if not s.spam_guard_enabled or verdict.verdict == BLOCK:
+        return verdict
+
+    try:
+        p = await jev_service.spam_probability(subject, _plain_text(body))
+    except Exception as exc:  # noqa: BLE001 — never block mail on a scanner bug
+        logger.warning("Jev spam check failed, keeping heuristic verdict: %s", exc)
+        return verdict
+    if p is None:
+        return verdict
+
+    verdict.jev_spam_probability = p
+    before = verdict.verdict
+    if p >= float(s.jev_spam_block_threshold) and s.spam_guard_block_enabled:
+        verdict.verdict = BLOCK
+        verdict.allowed = False
+    elif p >= float(s.jev_spam_flag_threshold) and verdict.verdict == PASS:
+        verdict.verdict = FLAG
+
+    if verdict.verdict != before:
+        verdict.issues.insert(0, f"Jev spam probability {p:.2f}")
+        logger.warning(
+            "Jev raised pre-send spam verdict %s → %s (p=%.2f) — subject=%r",
+            before, verdict.verdict, p, (subject or "")[:120],
+        )
+    return verdict
+
+
+async def scan_for_send_async(
+    subject: str,
+    body: str,
+    *,
+    has_unsubscribe: bool = True,
+) -> tuple[bool, SpamVerdict]:
+    """:func:`scan_async` in the shape a send path wants: ``(may_send, verdict)``."""
+    verdict = await scan_async(subject, body, has_unsubscribe=has_unsubscribe)
     return verdict.allowed, verdict

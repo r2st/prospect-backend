@@ -200,7 +200,7 @@ async def test_dispatcher_scan_can_be_skipped_by_a_caller_that_already_scanned(m
 
     calls: list = []
 
-    def _record(*args, **kwargs):
+    async def _record(*args, **kwargs):
         calls.append(args)
         return True, spam_guard.SpamVerdict()
 
@@ -208,7 +208,9 @@ async def test_dispatcher_scan_can_be_skipped_by_a_caller_that_already_scanned(m
     monkeypatch.setattr(
         "app.services.suppression.address_blocking_reason", _not_suppressed
     )
-    monkeypatch.setattr(spam_guard, "scan_for_send", _record)
+    # The dispatcher calls the async (Jev-aware) variant; patching the sync one
+    # would make ``calls == []`` true whether or not the scan was skipped.
+    monkeypatch.setattr(spam_guard, "scan_for_send_async", _record)
 
     with pytest.raises(AttributeError):
         # db=None means the dispatcher dies further downstream — which is the

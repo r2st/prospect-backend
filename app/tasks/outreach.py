@@ -1114,7 +1114,7 @@ def send_sequence_step(self, enrollment_id: str):
                 # copy edit rather than spent on a message filters would eat.
                 from app.services import spam_guard
 
-                _spam_ok, _spam_verdict = spam_guard.scan_for_send(subject, human_body)
+                _spam_ok, _spam_verdict = await spam_guard.scan_for_send_async(subject, human_body)
                 if not _spam_ok:
                     _spam_reason = _spam_verdict.reason()
                     await db.rollback()

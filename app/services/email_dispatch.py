@@ -906,7 +906,7 @@ async def send_outreach_email(
     if not skip_spam_scan:
         from app.services import spam_guard
 
-        allowed, verdict = spam_guard.scan_for_send(
+        allowed, verdict = await spam_guard.scan_for_send_async(
             subject, body_html, has_unsubscribe=include_unsubscribe
         )
         if not allowed:
