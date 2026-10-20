@@ -108,9 +108,11 @@ async def test_sent_email_carries_the_footer_exactly_once(db_session: AsyncSessi
     for part in (call["body_text"], call["body_html"]):
         assert part.count("Reply UNSUBSCRIBE") == 1
         assert "Powered by" not in part
-    from app.services.email_dispatch import default_sender_identity
+    # The footer names the sending mailbox's org.
+    from app.services.email_dispatch import resolve_sender_identity
 
-    assert call["body_text"].rstrip().endswith(default_sender_identity().line())
+    identity = await resolve_sender_identity(db_session, account.org_id)
+    assert call["body_text"].rstrip().endswith(identity.line())
     assert call["list_unsubscribe_url"] in call["body_text"]
 
 
@@ -281,3 +283,49 @@ def test_wrapping_never_gives_a_tag_two_style_attributes():
         assert len(re.findall(r"\bstyle\s*=", tag)) <= 1, tag
     assert '<p style="margin:0 0 10px 0">Hello' in html
     assert '<a style="color:#1a73e8;text-decoration:underline" href=' in html
+
+
+@pytest.mark.asyncio
+async def test_footer_follows_the_sending_mailbox_org_with_no_org_bound(db_session: AsyncSession, monkeypatch):
+    """A platform admin's send-now has no org bound; the footer must still be the
+    mailbox org's, never the deployment default."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.models.gmail_account import GmailAccount
+    from app.models.tenant import Organization
+    from app.services import email_dispatch
+
+    org = Organization(
+        id=uuid.uuid4(), name="DevHealLabs", slug=f"dh-{uuid.uuid4().hex[:6]}",
+        branding={"company_name": "DevHeal Labs",
+                  "company_address": "IDA Mallapur, Hyderabad, Telangana, India",
+                  "company_website": "https://devheallabs.com"},
+    )
+    db_session.add(org)
+    await db_session.flush()
+    account = GmailAccount(
+        id=uuid.uuid4(), email="rep@devheallabs.com", google_sub=str(uuid.uuid4()),
+        display_name="Rep", refresh_token_encrypted="x", status="connected",
+        sending_enabled=True, connected_at=datetime.now(timezone.utc), org_id=org.id,
+    )
+    db_session.add(account)
+    await db_session.flush()
+
+    sent = []
+
+    class _Transport:
+        def send_email(self, **kwargs):
+            sent.append(kwargs)
+            return {"status": "sent", "transport": "gmail", "sender": account.email}
+
+    monkeypatch.setattr(email_dispatch, "_make_sender", lambda a: _Transport())
+    await email_dispatch.send_outreach_email(
+        db_session, to_email="prospect@example.com", subject="Hi",
+        body_html="<p>Hello there.</p>", bypass_kill_switch=True, sender_account_id=account.id,
+    )
+    (call,) = sent
+    assert call["body_text"].rstrip().endswith(
+        "DevHeal Labs · IDA Mallapur, Hyderabad, Telangana, India\nhttps://devheallabs.com"
+    )
+    assert get_settings().company_name not in call["body_text"]

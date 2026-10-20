@@ -460,8 +460,16 @@ def sender_identity_for_org(org) -> SenderIdentity:
     return identity
 
 
-async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
-    """The current org's footer identity.
+async def resolve_sender_identity(
+    db: AsyncSession, org_id: Optional[uuid.UUID] = None
+) -> SenderIdentity:
+    """The footer identity of ``org_id``, else of the org bound to this context.
+
+    Callers pass the *sending mailbox's* org. The bound org alone was not
+    enough: a platform admin has no org of their own (``org_id`` NULL), so a
+    send-now from a tenant's campaign ran with nothing bound and the footer fell
+    back to the deployment's identity — another company's name and address on
+    the tenant's mail. The mailbox always belongs to the org that is sending.
 
     Never raises: a lookup failure must not stop the mail.
     """
@@ -469,7 +477,7 @@ async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
         from app.models.tenant import Organization
         from app.org_context import get_current_org_id
 
-        org_id = get_current_org_id()
+        org_id = org_id or get_current_org_id()
         if org_id is not None:
             org = await db.get(Organization, org_id)
             if org is not None:
@@ -966,7 +974,7 @@ async def send_outreach_email(
     unsubscribe_url = None
     if include_unsubscribe:
         unsubscribe_url = _make_unsubscribe_url(to_email)
-        identity = await resolve_sender_identity(db)
+        identity = await resolve_sender_identity(db, getattr(account, "org_id", None))
         body_html = body_html + _unsubscribe_footer_html(to_email, identity)
         body_text = body_text + _unsubscribe_footer_text(to_email, identity)
 
