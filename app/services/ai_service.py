@@ -985,8 +985,9 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
               "return_date": "YYYY-MM-DD" | None,   # OOO only
               "referral": {"name": None, "email": None},  # wrong_person only
               "unsubscribe_explicit": bool,
-              "source": "keyword|ai|fallback",
+              "source": "keyword|jev|ai|fallback",
               "model": "<model or None>",
+              "jev": {...},   # Jev's label + probabilities, when it was asked
             }
         """
         combined = f"{subject or ''}\n{body_text or ''}"
@@ -1028,7 +1029,20 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
                 "model": None,
             }
 
-        # 2. Ambiguous → ask the LLM. temperature=0 for stability.
+        # 2. Jev (TypeSafe System One) — a structured classifier with calibrated
+        #    probabilities. A confident label is the answer; a low-confidence
+        #    one, or ``wrong_person`` (whose referral only the LLM extracts),
+        #    falls through to the LLM and is kept as the answer if the LLM is
+        #    unavailable. Never raises; ``None`` when Jev is off or down.
+        jev = await self._jev_classify_reply(
+            subject, body_text, from_email, contact_name, company_name, combined
+        )
+        if jev is not None and jev["category"] != "wrong_person" and (
+            jev["confidence"] >= get_settings().jev_reply_min_confidence
+        ):
+            return jev
+
+        # 3. Ambiguous → ask the LLM. temperature=0 for stability.
         prompt = f"""Classify this reply to a cold sales email into EXACTLY ONE routing category.
 Your job is to CLASSIFY ONLY — do NOT draft a reply.
 
@@ -1070,7 +1084,47 @@ Return ONLY valid JSON:
 - unsubscribe_explicit: true ONLY for legally-explicit opt-out language."""
 
         result = await self.complete_json(prompt, max_tokens=400)
-        return self._normalize_classification(result)
+        normalized = self._normalize_classification(result)
+        if normalized["source"] == "fallback" and jev is not None:
+            return jev
+        if jev is not None:
+            normalized["jev"] = jev["jev"]
+        return normalized
+
+    async def _jev_classify_reply(
+        self,
+        subject: Optional[str],
+        body_text: Optional[str],
+        from_email: Optional[str],
+        contact_name: str,
+        company_name: str,
+        combined: str,
+    ) -> Optional[dict]:
+        """Jev's reply intent in :meth:`classify_reply`'s output shape, or ``None``.
+
+        ``source`` is ``"jev"``, so the confidence gate in
+        ``app.tasks.replies`` applies exactly as it does to an LLM label.
+        """
+        from app.services import jev_service
+
+        choice = await jev_service.classify_reply_intent(
+            subject, body_text,
+            from_email=from_email, contact_name=contact_name, company_name=company_name,
+        )
+        if choice is None or choice.label not in REPLY_CATEGORIES:
+            return None
+        category = choice.label
+        return {
+            "category": category,
+            "confidence": choice.confidence,
+            "reason": f"Jev classified as {category} (confidence {choice.confidence:.2f}).",
+            "return_date": extract_return_date(combined) if category == "out_of_office" else None,
+            "referral": {"name": None, "email": None},
+            "unsubscribe_explicit": category == "unsubscribe",
+            "source": "jev",
+            "model": choice.model,
+            "jev": choice.as_dict(),
+        }
 
     def _normalize_classification(self, result: dict) -> dict:
         """Validate/coerce a raw LLM classification into the canonical shape.

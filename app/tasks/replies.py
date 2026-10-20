@@ -619,6 +619,9 @@ async def classify_reply_record(
         "unsubscribe_explicit": result.get("unsubscribe_explicit", False),
         "return_date": result.get("return_date"),
         "referral": result.get("referral") or {"name": None, "email": None},
+        # Jev's label and probabilities whenever it was asked — including when
+        # the LLM made the final call — so the two can be compared per reply.
+        "jev": result.get("jev"),
     }
 
     handled = await route_auto_action(
