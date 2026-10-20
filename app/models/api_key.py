@@ -45,6 +45,12 @@ ALL_SCOPES = (
     "deals:write",
     "sequences:read",
     "sequences:write",
+    # The MCP server (app.mcp_server). Separate scopes so a key minted for the
+    # REST API does not silently gain campaign or mailbox access.
+    "campaigns:read",
+    "campaigns:write",
+    "mailboxes:read",
+    "suppression:read",
 )
 
 # Default requests-per-minute budget for a new key when the caller doesn't set

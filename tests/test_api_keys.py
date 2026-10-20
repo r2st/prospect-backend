@@ -109,6 +109,7 @@ async def test_scopes_catalog(client):
     assert set(scopes) == {
         "contacts:read", "contacts:write", "companies:read", "companies:write",
         "deals:read", "deals:write", "sequences:read", "sequences:write",
+        "campaigns:read", "campaigns:write", "mailboxes:read", "suppression:read",
     }
 
 

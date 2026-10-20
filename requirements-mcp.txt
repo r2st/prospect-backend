@@ -1,0 +1,38 @@
+# The MCP server (app/mcp_server, `python -m app.mcp_server`) — install into its
+# OWN venv, not the API image. `mcp` needs pydantic>=2.11 and the API pins
+# pydantic==2.10.3; this file is requirements-runtime.txt with the pydantic pins
+# relaxed, so the API's pins don't have to move for a process that never runs in
+# that image. Keep the two in step when runtime deps change.
+mcp==1.27.1
+fastapi>=0.115.6
+uvicorn[standard]==0.34.0
+slowapi==0.1.10
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+pydantic>=2.11,<3
+pydantic-settings>=2.7.0
+celery[redis]==5.4.0
+redis==5.2.1
+boto3==1.35.86
+anthropic>=0.45.0
+google-auth==2.37.0
+google-api-python-client==2.157.0
+cryptography==44.0.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+PyJWT==2.10.1
+httpx==0.28.1
+beautifulsoup4==4.12.3
+dnspython==2.7.0
+python-multipart==0.0.19
+python-dotenv==1.0.1
+email-validator==2.2.0
+jinja2==3.1.4
+itsdangerous==2.2.0
+python-jose[cryptography]==3.3.0
+pgvector==0.3.6
+# Discovery document upload: PDF / XLSX / DOCX text extraction
+pypdf==5.1.0
+openpyxl==3.1.5
+python-docx==1.1.2

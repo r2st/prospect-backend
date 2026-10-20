@@ -1305,3 +1305,23 @@ counts it. Subject-line tests default to `opened` — the subject decides whethe
 message is opened and barely touches what happens after, and cold reply rates
 (a few percent) need an order of magnitude more volume than open rates to reach
 significance. Omitting `metric` keeps the legacy reply-then-open behaviour.
+
+## The MCP server is a second client of the same handlers
+
+`app/mcp_server/` (`python -m app.mcp_server`, stdio) exposes Prospect to Claude
+Desktop/Code. See `FEATURE_MCP.md` for setup. Three things to keep true:
+
+- **Writes call the route functions** (`routers.campaigns.create_campaign`,
+  `add_contacts_to_campaign`) and never re-implement them. A tool that writes
+  directly is a second path past the gates the UI's path goes through.
+- **Auth is the public-API key, re-checked on every call** through
+  `api_key_auth.get_api_key_context`, inside `org_scope(None)`. That function
+  leaves the org bound, which is fine for a request task. In a long-lived
+  process the binding would outlive the call, so the reset is not optional.
+  Write tools act as the key's `created_by` user and refuse without one.
+- **fd 1 is the protocol.** `__main__.isolate_stdout` points fd 1 at stderr
+  before anything else is imported. SQLAlchemy `echo` writes to stdout.
+
+`mcp` needs pydantic>=2.11 and the API pins 2.10.3, so the server has its own
+`requirements-mcp.txt` and runs from its own venv. `tests/test_mcp_server.py`
+skips (and says so) under the prod pins. Run it from an MCP venv.
