@@ -4,12 +4,17 @@ slowapi==0.1.10
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 alembic==1.14.0
-pydantic==2.10.3
+pydantic==2.12.5
 pydantic-settings==2.7.0
 celery[redis]==5.4.0
 redis==5.2.1
 boto3==1.35.86
 anthropic>=0.45.0
+# TypeSafe AI Jev (System One) — structured lead/reply/spam decisions
+# (app/services/jev_service.py). Optional at runtime: every Jev call degrades
+# to "no opinion" when the package or TYPESAFE_API_KEY is absent. Requires
+# pydantic>=2.12, hence the pydantic pin above.
+typesafe-sdk==0.7.5
 google-auth==2.37.0
 google-api-python-client==2.157.0
 cryptography==44.0.0

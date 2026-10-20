@@ -8,6 +8,10 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production")
 # Disable the short-TTL response cache in tests — a hit from a prior test's data
 # would leak across the per-test in-memory DBs. The cache is verified separately.
 os.environ.setdefault("RESPONSE_CACHE_ENABLED", "false")
+# Jev (TypeSafe AI) is consulted on the scoring, reply and send paths whenever a
+# key is configured. Force it off so a key in .env or the shell can never make
+# the suite call the real API; Jev tests enable it explicitly with a mock.
+os.environ["TYPESAFE_API_KEY"] = ""
 
 import asyncio
 import json

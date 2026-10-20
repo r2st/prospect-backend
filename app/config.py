@@ -505,6 +505,29 @@ class Settings(BaseSettings):
     spam_guard_block_threshold: int = 50                 # "high" risk band
     spam_guard_block_enabled: bool = False
 
+    # TypeSafe AI's Jev (System One) — a structured decision model, not a text
+    # generator (app/services/jev_service.py). Empty key = every Jev call is
+    # skipped and its caller keeps the behaviour it had before Jev existed. Jev
+    # is an *extra* signal on three paths, never a dependency of any of them:
+    #  - lead scoring:  hot/warm/cold label stored in LeadScore.factors
+    #  - reply routing: tried after the keyword pre-filter, before the LLM
+    #  - spam gate:     can raise a send to "flag", and to "block" only when
+    #                   spam_guard_block_enabled is also on
+    typesafe_api_key: str = ""
+    typesafe_model: str = "jev-latest"
+    # Jev sits on the send path and in batch rescoring, so a slow API must not
+    # stall either: short timeout, no SDK retries, and a cooldown after a failure
+    # so a batch of 200 doesn't pay the timeout 200 times.
+    jev_timeout_seconds: float = 5.0
+    jev_failure_cooldown_seconds: int = 60
+    jev_lead_scoring_enabled: bool = True
+    jev_reply_classification_enabled: bool = True
+    # A Jev reply label below this confidence falls through to the LLM.
+    jev_reply_min_confidence: float = 0.75
+    jev_spam_check_enabled: bool = True
+    jev_spam_flag_threshold: float = 0.7
+    jev_spam_block_threshold: float = 0.9
+
     # Per-sender auto-pause on danger signals. When only individual accounts
     # breach (no global-scope breach), pause just those mailboxes instead of
     # halting all sending — a single bad list on one inbox shouldn't stop the
