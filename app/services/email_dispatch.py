@@ -106,7 +106,11 @@ def _inject_inline_styles(html: str) -> str:
         (r'<blockquote(?=[\s>])', '<blockquote style="border-left:3px solid #dadce0;padding-left:12px;margin:0 0 10px 0;color:#5f6368"'),
     ]
     for pattern, replacement in replacements:
-        html = re.sub(pattern, replacement, html)
+        # Leave a tag that already carries a style alone: injecting a second
+        # ``style=`` produced ``<p style="…" style="…">`` — invalid HTML (only
+        # the first attribute counts), and malformed markup is itself a
+        # spam-filter signal. Every footer paragraph and link hit it.
+        html = re.sub(pattern + r"(?![^>]*\bstyle\s*=)", replacement, html)
     return html
 
 

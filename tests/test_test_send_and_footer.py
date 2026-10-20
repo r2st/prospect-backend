@@ -237,3 +237,15 @@ def test_low_text_to_link_ratio_is_flagged():
     body = "<p>" + "We help infrastructure teams verify recovery outcomes. " * 6 + "https://example.com</p>"
     ok = opt.scan_content_heuristic("Infrastructure operations", body)
     assert not any("text-to-link" in i for i in ok["issues"])
+
+
+def test_wrapping_never_gives_a_tag_two_style_attributes():
+    import re
+
+    from app.services.email_dispatch import _unsubscribe_footer_html, wrap_html_email
+
+    html = wrap_html_email("<p>Hello <a href='https://example.com'>site</a></p>" + _unsubscribe_footer_html("p@example.com"))
+    for tag in re.findall(r"<[a-z][^>]*>", html):
+        assert len(re.findall(r"\bstyle\s*=", tag)) <= 1, tag
+    assert '<p style="margin:0 0 10px 0">Hello' in html
+    assert '<a style="color:#1a73e8;text-decoration:underline" href=' in html
