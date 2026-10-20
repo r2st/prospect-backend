@@ -570,3 +570,151 @@ async def _ensure_entry(
         )
         await db.rollback()
         return False
+
+
+# --------------------------------------------------------------------------
+# Reading the state back, and undoing *this* opt-out — not any other.
+# --------------------------------------------------------------------------
+
+
+class SubscriptionStatus(NamedTuple):
+    """What the unsubscribe page shows for one signed token.
+
+    ``can_resubscribe`` is false whenever the address is on a list for a reason
+    other than ``unsubscribe``. A bounce, a complaint, an operator's manual
+    entry and above all an erasure are not the recipient's to lift from a
+    footer link — the page offers re-subscribe only where the one thing in the
+    way is the opt-out that same link records.
+    """
+
+    email: str
+    unsubscribed: bool
+    can_resubscribe: bool
+
+
+def _scoped(stmt, column, org_id: Optional[uuid.UUID]):
+    # Same reading as ``record``: no org on the token (legacy shape) means every
+    # org holding the address. Explicit, with the global filter skipped, because
+    # these run from a public endpoint with no org bound.
+    stmt = stmt.execution_options(skip_org_filter=True)
+    return stmt.where(column == org_id) if org_id is not None else stmt
+
+
+async def status(
+    db: AsyncSession, email: Optional[str], *, org_id: Optional[uuid.UUID] = None
+) -> Optional[SubscriptionStatus]:
+    """Is ``email`` opted out of ``org_id``'s mail? ``None`` if not an address.
+
+    Asks the same two halves ``record`` writes: the list entries and the contact
+    flags. Either one is enough to read as unsubscribed — rows carrying a flag
+    with no list entry are in the database, and showing such a person an
+    "Unsubscribe" button for mail that has already stopped would be a lie in
+    the other direction.
+    """
+    normalized = normalize_email(email)
+    if normalized is None:
+        return None
+
+    reasons = set(
+        (
+            await db.execute(
+                _scoped(
+                    select(SuppressionEntry.reason).where(
+                        SuppressionEntry.email == normalized
+                    ),
+                    SuppressionEntry.org_id,
+                    org_id,
+                )
+            )
+        ).scalars().all()
+    )
+    flagged = (
+        await db.execute(
+            _scoped(
+                select(Contact.id)
+                .where(
+                    func.lower(Contact.email) == normalized,
+                    (Contact.suppressed.is_(True)) | (Contact.unsubscribed.is_(True)),
+                )
+                .limit(1),
+                Contact.org_id,
+                org_id,
+            )
+        )
+    ).first() is not None
+
+    return SubscriptionStatus(
+        email=normalized,
+        unsubscribed=bool(reasons) or flagged,
+        can_resubscribe=not (reasons - _OPT_OUT_REASONS),
+    )
+
+
+async def resubscribe(
+    db: AsyncSession, email: Optional[str], *, org_id: Optional[uuid.UUID] = None
+) -> Optional[SubscriptionStatus]:
+    """Undo an opt-out the recipient made with this same link. Commits.
+
+    Lifts only what :func:`record` writes for ``reason="unsubscribe"``: those
+    list entries, and the contact flags. Refuses (changes nothing, returns a
+    status with ``can_resubscribe=False``) when any other reason is on the list
+    — see :class:`SubscriptionStatus`. A contact's ``suppressed`` flag is the
+    same flag a bounce or a complaint sets, which is why the refusal is decided
+    before anything is touched rather than per row.
+
+    Stopped enrollments stay stopped. Re-subscribing says "you may mail me",
+    not "resume the cadence from step 3"; restarting outreach is an operator's
+    call, made from the product with the context to make it.
+    """
+    current = await status(db, email, org_id=org_id)
+    if current is None or not current.can_resubscribe:
+        return current
+    normalized = current.email
+    now = datetime.now(timezone.utc)
+
+    entries = (
+        await db.execute(
+            _scoped(
+                select(SuppressionEntry).where(
+                    SuppressionEntry.email == normalized,
+                    SuppressionEntry.reason.in_(_OPT_OUT_REASONS),
+                ),
+                SuppressionEntry.org_id,
+                org_id,
+            )
+        )
+    ).scalars().all()
+    for entry in entries:
+        await db.delete(entry)
+
+    contacts = (
+        await db.execute(
+            _scoped(
+                select(Contact).where(func.lower(Contact.email) == normalized),
+                Contact.org_id,
+                org_id,
+            )
+        )
+    ).scalars().all()
+    for contact in contacts:
+        was_opted_out = contact.suppressed or contact.unsubscribed
+        contact.suppressed = False
+        contact.unsubscribed = False
+        if was_opted_out:
+            db.add(
+                ConsentRecord(
+                    org_id=contact.org_id,
+                    contact_id=contact.id,
+                    consent_type="express",
+                    basis="re-subscribed via unsubscribe link",
+                    granted_at=now,
+                    revoked_at=None,
+                )
+            )
+
+    await db.commit()
+    logger.info(
+        "Re-subscribed %s: %d list entr(ies) lifted, %d contact(s) cleared",
+        normalized, len(entries), len(contacts),
+    )
+    return SubscriptionStatus(email=normalized, unsubscribed=False, can_resubscribe=True)

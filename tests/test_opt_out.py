@@ -140,11 +140,15 @@ async def test_one_click_writes_a_consent_record(client, db_session):
 
 @pytest.mark.asyncio
 async def test_get_path_does_the_same_thing_as_post(client, db_session):
-    """A human clicking the footer link and a provider POSTing must not differ."""
+    """A human pressing the page's button and a provider POSTing must not differ.
+
+    (The GET itself only renders the page — see ``test_unsubscribe_page.py``.)
+    """
     contact, enrollment = await _make_contact(db_session, "human@example.com")
 
-    resp = await client.get(
-        f"/api/v1/track/unsubscribe?token={_legacy_token('human@example.com')}"
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={_legacy_token('human@example.com')}",
+        data={"source": "page"},
     )
     assert resp.status_code == 200
     assert "unsubscribed" in resp.text.lower()

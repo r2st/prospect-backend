@@ -51,12 +51,18 @@ async def test_post_unsubscribe_one_click_marks_contact(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_get_unsubscribe_still_works(client, db_session):
-    """The user-clicked GET path keeps rendering a confirmation page."""
+async def test_get_unsubscribe_renders_a_page_and_the_button_unsubscribes(client, db_session):
+    """GET only shows the page; the page's button POST does the opt-out."""
     await _make_contact(db_session, "getunsub@example.com")
     token = _unsub_token("getunsub@example.com")
 
     resp = await client.get(f"/api/v1/track/unsubscribe?token={token}")
+    assert resp.status_code == 200
+    assert "getunsub@example.com" in resp.text
+
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={token}", data={"source": "page"}
+    )
     assert resp.status_code == 200
     assert "unsubscribed" in resp.text.lower()
 

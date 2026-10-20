@@ -81,6 +81,10 @@ PUBLIC_ROUTES: dict[str, str] = {
         "someone with no account. Refusing it is a compliance failure"
     ),
     "POST /api/v1/track/unsubscribe": "the one-click POST half of the same opt-out",
+    "POST /api/v1/track/resubscribe": (
+        "undoes the footer opt-out from the same page; reached by the same "
+        "account-less recipient and authorised by the same signed token"
+    ),
     "POST /api/v1/outreach/events": (
         "the send-ledger webhook, authenticated by HMAC signature or JWT in "
         "require_signed_webhook_or_user rather than by a session"

@@ -6,7 +6,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Response
+from html import escape
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -410,54 +413,184 @@ async def _process_unsubscribe(token: str, db: AsyncSession) -> bool:
     return True
 
 
-_UNSUB_OK_HTML = (
-    "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
-    "text-align: center; padding: 60px 20px; color: #333;'>"
-    "<h2 style='font-weight: 500; margin-bottom: 12px;'>You're unsubscribed</h2>"
-    "<p style='color: #666;'>We've removed you from our list. You won't hear from us again.</p>"
-    "</body></html>"
-)
-_UNSUB_ERR_HTML = (
-    "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
-    "text-align: center; padding: 60px 20px; color: #333;'>"
-    "<h2 style='font-weight: 500; margin-bottom: 12px;'>That link didn't work</h2>"
-    "<p style='color: #666;'>It may have expired. Just reply to any of our emails "
-    "with the word UNSUBSCRIBE and we'll take care of it.</p>"
-    "</body></html>"
-)
+# The page a human lands on from the footer link. Server-rendered with no
+# script: it has to work in whatever browser a mail client opens, and the two
+# actions are plain form POSTs so nothing happens until a person presses one.
+_PAGE_CSS = """
+:root { color-scheme: light dark; --bg:#f6f7f9; --card:#ffffff; --fg:#1d2330;
+  --muted:#5b6475; --border:#e3e6eb; --accent:#2f5bd3; --accent-fg:#ffffff;
+  --ok:#1f7a4d; }
+@media (prefers-color-scheme: dark) { :root { --bg:#12151b; --card:#1b2029;
+  --fg:#e8ebf0; --muted:#9aa3b2; --border:#2b3240; --accent:#7a9cff;
+  --accent-fg:#0d1220; --ok:#5fcf98; } }
+* { box-sizing: border-box; }
+body { margin:0; min-height:100vh; display:flex; align-items:center;
+  justify-content:center; padding:24px 16px; background:var(--bg); color:var(--fg);
+  font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+main { width:100%; max-width:440px; background:var(--card);
+  border:1px solid var(--border); border-radius:14px; padding:32px 24px;
+  text-align:center; }
+h1 { font-size:1.35rem; font-weight:600; margin:0 0 8px; }
+p { margin:0 0 20px; color:var(--muted); }
+.email { display:block; margin:0 0 24px; font-weight:600; color:var(--fg);
+  word-break:break-all; }
+.ok { color:var(--ok); }
+button { width:100%; min-height:48px; padding:12px 20px; font:inherit;
+  font-weight:600; border-radius:10px; cursor:pointer; border:1px solid var(--accent);
+  background:var(--accent); color:var(--accent-fg); }
+button.secondary { background:transparent; color:var(--accent); }
+button:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+"""
+
+
+def _unsub_page(title: str, body_html: str, status_code: int = 200) -> HTMLResponse:
+    html = (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<meta name='robots' content='noindex, nofollow, noarchive'>"
+        "<meta name='referrer' content='no-referrer'>"
+        f"<title>{escape(title)}</title><style>{_PAGE_CSS}</style></head>"
+        f"<body><main>{body_html}</main></body></html>"
+    )
+    return HTMLResponse(
+        html,
+        status_code=status_code,
+        headers={
+            # The token in the URL is a capability over this address's
+            # subscription. Keep it out of search indexes, caches and the
+            # Referer header of anything the page might link to.
+            "X-Robots-Tag": "noindex, nofollow, noarchive",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+def _status_page(token: str, state: "opt_out.SubscriptionStatus", *, just_changed: bool = False) -> HTMLResponse:
+    email_html = f"<span class='email'>{escape(state.email)}</span>"
+    q = escape(quote(token, safe=""))
+    if not state.unsubscribed:
+        if just_changed:
+            heading = "<h1 class='ok'>You're subscribed again</h1>"
+            lead = "<p>Welcome back. You'll keep receiving our emails at</p>"
+        else:
+            heading = "<h1>Unsubscribe from our emails?</h1>"
+            lead = "<p>Press the button below to stop all emails to</p>"
+        return _unsub_page(
+            "Email preferences",
+            heading + lead + email_html
+            + f"<form method='post' action='unsubscribe?token={q}'>"
+            "<input type='hidden' name='source' value='page'>"
+            "<button type='submit'>Unsubscribe</button></form>",
+        )
+    heading = "<h1 class='ok'>You're unsubscribed</h1>"
+    lead = "<p>We won't send any more emails to</p>"
+    if not state.can_resubscribe:
+        return _unsub_page("Unsubscribed", heading + lead + email_html)
+    return _unsub_page(
+        "Unsubscribed",
+        heading + lead + email_html
+        + "<p>Unsubscribed by mistake?</p>"
+        + f"<form method='post' action='resubscribe?token={q}'>"
+        "<button type='submit' class='secondary'>Re-subscribe</button></form>",
+    )
+
+
+def _error_page(status_code: int = 400) -> HTMLResponse:
+    return _unsub_page(
+        "Link not valid",
+        "<h1>That link didn't work</h1>"
+        "<p>It may have expired. Just reply to any of our emails with the word "
+        "UNSUBSCRIBE and we'll take care of it.</p>",
+        status_code=status_code,
+    )
+
+
+async def _token_status(token: str, db: AsyncSession):
+    """Verify ``token`` and read its address's state. ``None`` if not genuine."""
+    try:
+        email, org_id = _decode_unsubscribe_token(token)
+    except Exception:
+        return None, None, None
+    state = await opt_out.status(db, email, org_id=org_id)
+    return email, org_id, state
 
 
 @router.get("/unsubscribe")
 async def unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
-    """Handle a user-clicked unsubscribe link (renders a confirmation page)."""
-    try:
-        if not await _process_unsubscribe(token, db):
-            # "You're unsubscribed" is a promise. Only make it when the address
-            # is genuinely on a suppression list — the page used to say it
-            # unconditionally, including when nothing had been recorded at all.
-            return HTMLResponse(_UNSUB_ERR_HTML, status_code=400)
-        return HTMLResponse(_UNSUB_OK_HTML)
-    except Exception as e:
-        logger.warning("Unsubscribe failed: %s", str(e))
-        return HTMLResponse(_UNSUB_ERR_HTML, status_code=400)
+    """Show the address and an Unsubscribe button. Changes nothing.
+
+    This used to unsubscribe on load. A GET is not consent: mail security
+    scanners (Safe Links, Mimecast, Proofpoint) fetch every link in a message
+    before the human sees it, so an opt-out on GET unsubscribes recipients who
+    never clicked. The opt-out is the POST the button sends — and the RFC 8058
+    one-click POST below, which a mailbox provider only sends on a user's click.
+
+    Status is shown only for a token that verifies; anything else gets the
+    error page and learns nothing about any address.
+    """
+    _, _, state = await _token_status(token, db)
+    if state is None:
+        return _error_page()
+    return _status_page(token, state)
 
 
 @router.post("/unsubscribe")
-async def unsubscribe_one_click(token: str, db: AsyncSession = Depends(get_db)):
-    """Handle RFC 8058 one-click unsubscribe.
+async def unsubscribe_one_click(
+    request: Request, token: str, db: AsyncSession = Depends(get_db)
+):
+    """Handle RFC 8058 one-click unsubscribe, and the page's Unsubscribe button.
 
     Gmail/Yahoo bulk-sender guidelines (June 2024) require a ``List-Unsubscribe:
     <https…>`` URL paired with ``List-Unsubscribe-Post: List-Unsubscribe=One-Click``.
     The mailbox provider then POSTs to that URL (no human ever loads the page), so
     this must accept POST or the provider gets a 405 and the one-click affordance
-    is treated as broken. Processes the unsubscribe exactly like the GET path and
-    returns a small 200 body (the provider ignores the content).
+    is treated as broken. That caller gets a small 200 body (ignored).
+
+    The page's button posts here too, with ``source=page`` in the form, and gets
+    the confirmation page back. Same URL on purpose: one opt-out code path.
+    """
+    from_page = False
+    try:
+        form = await request.form()
+        from_page = form.get("source") == "page"
+    except Exception:
+        pass
+
+    try:
+        ok = await _process_unsubscribe(token, db)
+    except Exception as e:
+        logger.warning("Unsubscribe failed: %s", str(e))
+        ok = False
+    if not from_page:
+        # A 400 tells the provider the token was bad; the address stays subscribed.
+        return Response(status_code=200 if ok else 400)
+    if not ok:
+        return _error_page()
+    # Re-read rather than assume: the page promises what the database says.
+    _, _, state = await _token_status(token, db)
+    if state is None or not state.unsubscribed:
+        return _error_page()
+    return _status_page(token, state, just_changed=True)
+
+
+@router.post("/resubscribe")
+async def resubscribe(token: str, db: AsyncSession = Depends(get_db)):
+    """Undo this link's opt-out. 403 unless the token is genuine.
+
+    Re-subscribing re-opens mail to a person, so unlike the opt-out — where
+    being lenient errs towards sending less — a token that does not verify is
+    refused outright. What it may lift is narrow; see ``opt_out.resubscribe``.
     """
     try:
-        if not await _process_unsubscribe(token, db):
-            return Response(status_code=400)
-        return Response(status_code=200)
-    except Exception as e:
-        logger.warning("One-click unsubscribe failed: %s", str(e))
-        # A 400 tells the provider the token was bad; the address stays subscribed.
-        return Response(status_code=400)
+        email, org_id = _decode_unsubscribe_token(token)
+    except Exception:
+        return _error_page(status_code=403)
+    state = await opt_out.resubscribe(db, email, org_id=org_id)
+    if state is None:
+        return _error_page(status_code=403)
+    if state.unsubscribed:
+        # On the list for a reason this link did not put there (bounce,
+        # complaint, erasure, manual). Nothing changed; say so plainly.
+        return _status_page(token, state)
+    return _status_page(token, state, just_changed=True)
