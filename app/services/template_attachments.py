@@ -31,6 +31,8 @@ import re
 import uuid
 from dataclasses import dataclass
 from email import encoders
+from email.charset import QP, Charset
+from email.utils import formatdate, make_msgid
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -158,6 +160,34 @@ async def load_for_send(
     ]
 
 
+def _text_part(body: str, subtype: str) -> MIMEText:
+    """A UTF-8 text part, quoted-printable rather than base64.
+
+    ``MIMEText(body, subtype, "utf-8")`` base64-encodes the body. Ordinary mail
+    clients send readable text as quoted-printable, and a base64-encoded
+    text/plain or text/html part is a long-standing spam-filter strike (it is
+    how content gets hidden from naive scanners).
+    """
+    charset = Charset("utf-8")
+    charset.body_encoding = QP
+    return MIMEText(body, subtype, charset)
+
+
+def apply_identity_headers(message, sender_email: str) -> None:
+    """Set ``Date`` and ``Message-ID``, as every well-formed message carries.
+
+    Mail with no Message-ID or Date is a classic spam-filter strike. Gmail's
+    API and SES fill them in on the way out, but only SMTP set them here, so
+    whether a message was well-formed depended on which transport carried it.
+    The Message-ID is minted on the sender's own domain so it aligns with From.
+    """
+    if "Date" not in message:
+        message["Date"] = formatdate(usegmt=True)
+    if "Message-ID" not in message:
+        domain = (sender_email or "").rsplit("@", 1)[-1] or None
+        message["Message-ID"] = make_msgid(domain=domain)
+
+
 def build_mime_body(
     body_text: Optional[str],
     body_html: str,
@@ -173,10 +203,10 @@ def build_mime_body(
     if body_html:
         alternative = MIMEMultipart("alternative")
         if body_text:
-            alternative.attach(MIMEText(body_text, "plain", "utf-8"))
-        alternative.attach(MIMEText(body_html, "html", "utf-8"))
+            alternative.attach(_text_part(body_text, "plain"))
+        alternative.attach(_text_part(body_html, "html"))
     else:
-        alternative = MIMEText(body_text or "", "plain", "utf-8")
+        alternative = _text_part(body_text or "", "plain")
 
     files = list(attachments or ())
     if not files:

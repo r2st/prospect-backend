@@ -7,7 +7,11 @@ from jinja2.sandbox import SandboxedEnvironment
 
 
 from app.config import get_settings
-from app.services.template_attachments import OutgoingAttachment, build_mime_body
+from app.services.template_attachments import (
+    OutgoingAttachment,
+    apply_identity_headers,
+    build_mime_body,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -62,7 +66,7 @@ class EmailSender:
             "\n\n—\n"
             f"Don't want these emails? Reply UNSUBSCRIBE or click: "
             f"{unsubscribe_url}\n"
-            "Powered by DoAide Prospect — https://prospect.doaide.com"
+            f"{settings.company_name}, {settings.company_postal_address}"
         )
 
     def _send_raw(
@@ -93,6 +97,7 @@ class EmailSender:
         message["To"] = to_email
         message["From"] = self.sender
         message["Subject"] = subject
+        apply_identity_headers(message, self.sender)
         if reply_to:
             message["Reply-To"] = reply_to
         for name, value in unsubscribe_headers(

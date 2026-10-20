@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 
 
 class AuthorizeResponse(BaseModel):
@@ -26,6 +26,14 @@ class GmailAccountRead(BaseModel):
     daily_send_count: int = 0
     connected_at: datetime
     last_used_at: Optional[datetime] = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def deliverability_warning(self) -> Optional[str]:
+        """Set for a personal (free-mail) mailbox — see ``is_personal_mailbox``."""
+        from app.services.email_dispatch import PERSONAL_MAILBOX_WARNING, is_personal_mailbox
+
+        return PERSONAL_MAILBOX_WARNING if is_personal_mailbox(self.email) else None
 
 
 class GmailStatusResponse(BaseModel):

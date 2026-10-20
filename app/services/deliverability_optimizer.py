@@ -455,6 +455,17 @@ class DeliverabilityOptimizer:
             issues.append(f"{links} links (too many)")
             suggestions.append("Reduce to one primary link.")
 
+        # Text-to-link ratio: a short body carrying links reads as a link drop,
+        # however few the links. Count words in the visible text only.
+        if links:
+            visible = re.sub(r"<[^>]+>", " ", body)
+            visible = re.sub(r"https?://\S+", " ", visible)
+            words = len(re.findall(r"[A-Za-z]{2,}", visible))
+            if words / links < 25:
+                score += 10
+                issues.append(f"low text-to-link ratio ({words} words for {links} link(s))")
+                suggestions.append("Add substance or drop a link — aim for 25+ words per link.")
+
         # Missing unsubscribe.
         if not has_unsubscribe:
             score += 15

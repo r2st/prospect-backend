@@ -20,7 +20,11 @@ from googleapiclient.errors import HttpError
 
 from app.config import get_settings
 from app.services import crypto, google_oauth
-from app.services.template_attachments import OutgoingAttachment, build_mime_body
+from app.services.template_attachments import (
+    OutgoingAttachment,
+    apply_identity_headers,
+    build_mime_body,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +105,7 @@ class GmailSender:
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
+        apply_identity_headers(message, self.sender_email)
         if reply_to:
             message["Reply-To"] = reply_to
         _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
@@ -188,6 +193,7 @@ class GmailSender:
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
+        apply_identity_headers(message, self.sender_email)
         if reply_to:
             message["Reply-To"] = reply_to
         if in_reply_to:

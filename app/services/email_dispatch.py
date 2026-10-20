@@ -328,7 +328,35 @@ async def get_next_rotation_account(db: AsyncSession):
         return None
     # Prefer healthy accounts; never halt sending entirely if all are throttled.
     pool = await _filter_by_sender_health(db, accounts) or accounts
+    # Prefer business-domain mailboxes over personal ones (gmail.com, outlook.com
+    # …). Cold outreach from a free-mail address is one of the strongest spam
+    # signals there is, and in rotation it drags down every message it carries.
+    # A personal mailbox still sends when it is the only one left.
+    business = [a for a in pool if not is_personal_mailbox(a.email)]
+    if business:
+        pool = business
+    else:
+        logger.warning(
+            "Only personal mailboxes are sending-enabled (%s); cold outreach from "
+            "free-mail addresses is likely to land in spam",
+            ", ".join(sorted(a.email for a in pool)),
+        )
     return min(pool, key=_rotation_key)
+
+
+def is_personal_mailbox(email: Optional[str]) -> bool:
+    """Is this a free-mail (consumer) address rather than a business domain?"""
+    from app.services.crm_import import FREE_EMAIL_DOMAINS
+
+    domain = (email or "").rsplit("@", 1)[-1].strip().lower()
+    return domain in FREE_EMAIL_DOMAINS
+
+
+PERSONAL_MAILBOX_WARNING = (
+    "Personal mailbox: cold outreach from a free-mail address (gmail.com, "
+    "outlook.com …) is a top spam trigger. Rotation uses your business-domain "
+    "mailboxes first; send outreach from a domain you own."
+)
 
 
 async def resolve_sender_info(
@@ -367,7 +395,49 @@ async def resolve_sender_info(
     )
 
 
-POWERED_BY_URL = "https://prospect.doaide.com"
+@dataclass(frozen=True)
+class SenderIdentity:
+    """Who the mail is from, for the CAN-SPAM / CASL footer line.
+
+    Both laws require the sender's name and a valid physical postal address on
+    every commercial email. Per org: ``Organization.config["sender_identity"]``
+    with ``legal_name`` and ``postal_address``; otherwise the deployment's
+    ``company_name`` / ``company_postal_address`` settings.
+    """
+
+    name: str
+    postal_address: str
+
+    def line(self) -> str:
+        return f"{self.name}, {self.postal_address}"
+
+
+def default_sender_identity() -> SenderIdentity:
+    settings = get_settings()
+    return SenderIdentity(settings.company_name, settings.company_postal_address)
+
+
+async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
+    """The current org's footer identity, falling back to the deployment's.
+
+    Never raises: a footer without the org override is still a compliant
+    footer, and a lookup failure must not stop the mail.
+    """
+    try:
+        from app.models.tenant import Organization
+        from app.org_context import get_current_org_id
+
+        org_id = get_current_org_id()
+        if org_id is not None:
+            org = await db.get(Organization, org_id)
+            cfg = ((org.config or {}) if org else {}).get("sender_identity") or {}
+            address = (cfg.get("postal_address") or "").strip()
+            if address:
+                name = (cfg.get("legal_name") or "").strip() or org.name
+                return SenderIdentity(name, address)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Sender identity lookup failed; using the default")
+    return default_sender_identity()
 
 
 def _make_unsubscribe_url(contact_email: str) -> str:
@@ -386,30 +456,40 @@ def _make_unsubscribe_url(contact_email: str) -> str:
     return make_unsubscribe_url(contact_email)
 
 
-def _unsubscribe_footer_text(contact_email: str) -> str:
-    """Plain-text unsubscribe footer for the text/plain part."""
+def _unsubscribe_footer_text(
+    contact_email: str, identity: Optional[SenderIdentity] = None
+) -> str:
+    """Plain-text unsubscribe footer for the text/plain part.
+
+    Unsubscribe plus the sender's name and postal address, nothing else. No
+    "Powered by" link: a link to a domain other than the sender's, in every
+    message, is a cross-domain signal filters score against cold mail.
+    """
+    identity = identity or default_sender_identity()
     unsubscribe_url = _make_unsubscribe_url(contact_email)
     return (
         "\n\n—\n"
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        f"Powered by DoAide Prospect — {POWERED_BY_URL}"
+        f"{identity.line()}"
     )
 
 
-def _unsubscribe_footer_html(contact_email: str) -> str:
+def _unsubscribe_footer_html(
+    contact_email: str, identity: Optional[SenderIdentity] = None
+) -> str:
     """HTML unsubscribe footer with proper inline styles.
 
-    Same three lines as :func:`_unsubscribe_footer_text`, so the HTML and
-    plain-text parts say the same thing.
+    Same lines as :func:`_unsubscribe_footer_text`, so the HTML and plain-text
+    parts say the same thing.
     """
+    identity = identity or default_sender_identity()
     unsubscribe_url = html_mod.escape(_make_unsubscribe_url(contact_email), quote=True)
     return (
         '<p style="margin:24px 0 0 0;font-size:12px;color:#6b7280">—<br>'
         'Don\'t want these emails? Reply UNSUBSCRIBE or click: '
         f'<a href="{unsubscribe_url}" style="color:#6b7280">unsubscribe</a><br>'
-        f'Powered by DoAide Prospect — <a href="{POWERED_BY_URL}" style="color:#6b7280">'
-        f'{POWERED_BY_URL}</a></p>'
+        f'{html_mod.escape(identity.line())}</p>'
     )
 
 
@@ -839,8 +919,9 @@ async def send_outreach_email(
     unsubscribe_url = None
     if include_unsubscribe:
         unsubscribe_url = _make_unsubscribe_url(to_email)
-        body_html = body_html + _unsubscribe_footer_html(to_email)
-        body_text = body_text + _unsubscribe_footer_text(to_email)
+        identity = await resolve_sender_identity(db)
+        body_html = body_html + _unsubscribe_footer_html(to_email, identity)
+        body_text = body_text + _unsubscribe_footer_text(to_email, identity)
 
     # Wrap in a complete HTML email document with inline styles — or, for a
     # plain-text send, drop the HTML part altogether.
