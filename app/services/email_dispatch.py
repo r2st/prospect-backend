@@ -401,31 +401,69 @@ async def resolve_sender_info(
 
 @dataclass(frozen=True)
 class SenderIdentity:
-    """Who the mail is from, for the CAN-SPAM / CASL footer line.
+    """Who the mail is from, for the footer's CAN-SPAM / CASL lines.
 
     Both laws require the sender's name and a valid physical postal address on
-    every commercial email. Per org: ``Organization.config["sender_identity"]``
-    with ``legal_name`` and ``postal_address``; otherwise the deployment's
-    ``company_name`` / ``company_postal_address`` settings.
+    every commercial email, and the sender is the *organization* using
+    Prospect — not DoAide. So it comes from the org's own settings
+    (``Organization.branding``, edited on Organization Settings):
+
+    * ``company_name``    — falls back to the org's name;
+    * ``company_address`` — the postal address (left out when not set, with a
+      warning logged: the footer is then not CAN-SPAM complete);
+    * ``company_website`` — optional, its own line under the address.
+
+    A link to the sender's *own* website aligns with the From domain, unlike the
+    old "Powered by DoAide Prospect" link to a third-party domain.
     """
 
     name: str
-    postal_address: str
+    postal_address: str = ""
+    website: str = ""
 
     def line(self) -> str:
-        return f"{self.name}, {self.postal_address}"
+        return f"{self.name} · {self.postal_address}" if self.postal_address else self.name
+
+    @property
+    def website_url(self) -> str:
+        site = self.website.strip()
+        if site and not re.match(r"^https?://", site, re.IGNORECASE):
+            site = f"https://{site}"
+        return site
 
 
 def default_sender_identity() -> SenderIdentity:
+    """The deployment's identity, for a send with no organization bound."""
     settings = get_settings()
     return SenderIdentity(settings.company_name, settings.company_postal_address)
 
 
-async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
-    """The current org's footer identity, falling back to the deployment's.
+def sender_identity_for_org(org) -> SenderIdentity:
+    """The footer identity from an org's branding settings."""
+    branding = org.branding or {}
 
-    Never raises: a footer without the org override is still a compliant
-    footer, and a lookup failure must not stop the mail.
+    def _get(key: str) -> str:
+        value = branding.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    identity = SenderIdentity(
+        name=_get("company_name") or org.name,
+        postal_address=_get("company_address"),
+        website=_get("company_website"),
+    )
+    if not identity.postal_address:
+        logger.warning(
+            "Org %s has no company address set; email footers omit the postal "
+            "address CAN-SPAM requires. Set it on Organization Settings.",
+            getattr(org, "slug", org.id),
+        )
+    return identity
+
+
+async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
+    """The current org's footer identity.
+
+    Never raises: a lookup failure must not stop the mail.
     """
     try:
         from app.models.tenant import Organization
@@ -434,11 +472,8 @@ async def resolve_sender_identity(db: AsyncSession) -> SenderIdentity:
         org_id = get_current_org_id()
         if org_id is not None:
             org = await db.get(Organization, org_id)
-            cfg = ((org.config or {}) if org else {}).get("sender_identity") or {}
-            address = (cfg.get("postal_address") or "").strip()
-            if address:
-                name = (cfg.get("legal_name") or "").strip() or org.name
-                return SenderIdentity(name, address)
+            if org is not None:
+                return sender_identity_for_org(org)
     except Exception:  # pragma: no cover - defensive
         logger.exception("Sender identity lookup failed; using the default")
     return default_sender_identity()
@@ -465,9 +500,10 @@ def _unsubscribe_footer_text(
 ) -> str:
     """Plain-text unsubscribe footer for the text/plain part.
 
-    Unsubscribe plus the sender's name and postal address, nothing else. No
-    "Powered by" link: a link to a domain other than the sender's, in every
-    message, is a cross-domain signal filters score against cold mail.
+    Unsubscribe plus the sender's name, postal address and website (see
+    :class:`SenderIdentity`), nothing else. No "Powered by" link: a link to a
+    domain other than the sender's, in every message, is a cross-domain signal
+    filters score against cold mail.
     """
     identity = identity or default_sender_identity()
     unsubscribe_url = _make_unsubscribe_url(contact_email)
@@ -476,6 +512,7 @@ def _unsubscribe_footer_text(
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
         f"{identity.line()}"
+        + (f"\n{identity.website_url}" if identity.website_url else "")
     )
 
 
@@ -493,7 +530,13 @@ def _unsubscribe_footer_html(
         '<p style="margin:24px 0 0 0;font-size:12px;color:#6b7280">—<br>'
         'Don\'t want these emails? Reply UNSUBSCRIBE or click: '
         f'<a href="{unsubscribe_url}" style="color:#6b7280">unsubscribe</a><br>'
-        f'{html_mod.escape(identity.line())}</p>'
+        f'{html_mod.escape(identity.line())}'
+        + (
+            f'<br><a href="{html_mod.escape(identity.website_url, quote=True)}" '
+            f'style="color:#6b7280">{html_mod.escape(identity.website_url)}</a>'
+            if identity.website_url else ""
+        )
+        + '</p>'
     )
 
 

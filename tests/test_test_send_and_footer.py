@@ -30,13 +30,46 @@ def test_footer_is_unsubscribe_and_postal_address_only():
         assert 'href="https://prospect.doaide.com"' not in footer
 
 
-def test_footer_uses_the_org_sender_identity_when_set():
-    from app.services.email_dispatch import SenderIdentity, _unsubscribe_footer_text
+def test_footer_is_built_from_the_org_branding():
+    """Each org's own name, address and website — never DoAide's."""
+    from types import SimpleNamespace
 
-    footer = _unsubscribe_footer_text(
-        "p@example.com", SenderIdentity("DevHeal Labs AI Pvt Ltd", "1 MG Road, Bengaluru 560001, India")
+    from app.services.email_dispatch import (
+        _unsubscribe_footer_html,
+        _unsubscribe_footer_text,
+        sender_identity_for_org,
     )
-    assert footer.rstrip().endswith("DevHeal Labs AI Pvt Ltd, 1 MG Road, Bengaluru 560001, India")
+
+    org = SimpleNamespace(
+        id="o", slug="devheallabs", name="DevHealLabs",
+        branding={
+            "company_name": "DevHeal Labs",
+            "company_address": "IDA Mallapur, Hyderabad, Telangana, India",
+            "company_website": "devheallabs.com",
+        },
+    )
+    identity = sender_identity_for_org(org)
+    text = _unsubscribe_footer_text("p@example.com", identity)
+    html = _unsubscribe_footer_html("p@example.com", identity)
+
+    assert text.endswith(
+        "DevHeal Labs · IDA Mallapur, Hyderabad, Telangana, India\nhttps://devheallabs.com"
+    )
+    assert '<a href="https://devheallabs.com"' in html
+    for footer in (text, html):
+        assert "DoAide" not in footer
+        assert "Apprend" not in footer
+
+
+def test_org_without_branding_uses_its_own_name_and_no_foreign_address():
+    from types import SimpleNamespace
+
+    from app.services.email_dispatch import _unsubscribe_footer_text, sender_identity_for_org
+
+    org = SimpleNamespace(id="o", slug="acme", name="Acme Corp", branding={})
+    text = _unsubscribe_footer_text("p@example.com", sender_identity_for_org(org))
+    assert text.rstrip().endswith("Acme Corp")
+    assert get_settings().company_postal_address not in text
 
 
 @pytest.mark.asyncio
@@ -75,10 +108,9 @@ async def test_sent_email_carries_the_footer_exactly_once(db_session: AsyncSessi
     for part in (call["body_text"], call["body_html"]):
         assert part.count("Reply UNSUBSCRIBE") == 1
         assert "Powered by" not in part
-    settings = get_settings()
-    assert call["body_text"].rstrip().endswith(
-        f"{settings.company_name}, {settings.company_postal_address}"
-    )
+    from app.services.email_dispatch import default_sender_identity
+
+    assert call["body_text"].rstrip().endswith(default_sender_identity().line())
     assert call["list_unsubscribe_url"] in call["body_text"]
 
 
