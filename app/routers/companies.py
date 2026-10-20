@@ -93,6 +93,31 @@ async def _attach_extras(db: AsyncSession, companies: list[Company]) -> None:
         c.primary_contact = _to_company_contact(primary) if primary else None
 
 
+# Fields the lead scorer reads. A PATCH touching only notes or stage doesn't
+# change the lead, so it doesn't write a new score row.
+_SCORING_FIELDS = frozenset({
+    "name", "domain", "city", "state_province", "country", "employee_count",
+    "naics_code", "naics_description", "industry_segment", "website", "tags",
+})
+
+
+async def _score_best_effort(db: AsyncSession, company: Company) -> None:
+    """Score a lead after it is created or its firmographics change.
+
+    Rule-based fit plus Jev's hot/warm/cold temperature (when configured). Under
+    a savepoint, and never raising: a scoring failure must not lose the write
+    the caller asked for. Only CSV imports and ingestion scored new companies
+    before this; a lead added by hand sat unscored until the nightly rescore.
+    """
+    from app.services.scoring import score_company_rule_based
+
+    try:
+        async with db.begin_nested():
+            await score_company_rule_based(db, company)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lead scoring failed for %s: %s", company.id, exc)
+
+
 @router.post("/", response_model=CompanyRead, status_code=201)
 async def create_company(
     payload: CompanyCreate,
@@ -104,6 +129,7 @@ async def create_company(
     await db.flush()
     await db.refresh(company)
     logger.info("Created company %s (%s)", company.name, company.id)
+    await _score_best_effort(db, company)
 
     # AI Company Research Agent (feature 1.4): kick off a research brief on
     # creation. Best-effort — if the broker is unreachable, the periodic
@@ -537,6 +563,8 @@ async def update_company(
         setattr(company, field, value)
 
     await db.flush()
+    if _SCORING_FIELDS & update_data.keys():
+        await _score_best_effort(db, company)
     await db.refresh(company)
     logger.info("Updated company %s", company_id)
     return company

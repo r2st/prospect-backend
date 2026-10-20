@@ -28,6 +28,7 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.services.industry_verticals import matches_manufacturing, resolve_vertical
+from app.services.jev_scoring import jev_lead_temperature
 
 logger = logging.getLogger(__name__)
 
@@ -663,6 +664,20 @@ async def score_company_rule_based(
         },
         "score_change": change,
     }
+
+    # --- Jev lead temperature (hot / warm / cold) ---
+    # An independent second opinion from TypeSafe's Jev, stored beside the
+    # rule-based breakdown. Absent (not null) when Jev is unconfigured or
+    # unavailable, so the row is exactly the pre-Jev shape in that case.
+    jev_temp = await jev_lead_temperature(
+        company,
+        contacts,
+        signals_in_24h=velocity_signals,
+        most_recent_event=most_recent_event,
+        intent_breakdown=intent_breakdown,
+    )
+    if jev_temp is not None:
+        factors["jev_temperature"] = jev_temp
 
     lead_score = LeadScore(
         company_id=company.id,
