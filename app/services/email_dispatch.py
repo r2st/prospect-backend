@@ -949,7 +949,7 @@ async def send_outreach_email(
         if slot.blocked is not None:
             return slot.blocked
 
-    # Append email signature (specific or default)
+    # Append email signature (specific or default, scoped to the sender's org)
     signature = None
     if signature_id is not None:
         result = await db.execute(
@@ -957,9 +957,11 @@ async def send_outreach_email(
         )
         signature = result.scalar_one_or_none()
     if signature is None:
-        result = await db.execute(
-            select(EmailSignature).where(EmailSignature.is_default == True)  # noqa: E712
-        )
+        sender_org_id = getattr(account, "org_id", None)
+        q = select(EmailSignature).where(EmailSignature.is_default == True)  # noqa: E712
+        if sender_org_id is not None:
+            q = q.where(EmailSignature.org_id == sender_org_id)
+        result = await db.execute(q)
         signature = result.scalar_one_or_none()
     if signature is not None and signature.content_html:
         body_html = body_html + "<br><br>" + signature.content_html

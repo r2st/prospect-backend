@@ -148,6 +148,8 @@ class EmailComposeRequest(BaseModel):
     sender_account_id: Optional[uuid.UUID] = None
     subject_b: Optional[str] = Field(None, max_length=500, description="Variant B subject for A/B testing")
     scheduled_at: Optional[datetime] = Field(None, description="Schedule send for later")
+    track_opens: bool = Field(True, description="Inject open-tracking pixel into email body")
+    signature_id: Optional[uuid.UUID] = Field(None, description="Email signature to use; falls back to org/default")
 
 
 class EmailComposeResult(BaseModel):

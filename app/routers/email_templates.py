@@ -848,9 +848,11 @@ async def compose_and_send(
             db.add(email_send)
             await db.flush()
 
-            # Inject open tracking pixel into email body
-            tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
-            body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
+            # Inject open tracking pixel into email body (opt-out for cold
+            # first-touch sends where a hidden pixel hurts deliverability)
+            if payload.track_opens:
+                tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
+                body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
 
             # Handle scheduled sends. The rendered copy has to be **persisted**
             # here: the merge context is built from the contact and company as
@@ -884,6 +886,7 @@ async def compose_and_send(
                 subject=subject,
                 body_html=body_html,
                 sender_account_id=payload.sender_account_id,
+                signature_id=payload.signature_id,
                 attachments=attachments,
             )
             status = send_result.get("status", "error")
